@@ -1,0 +1,19 @@
+[Unit]
+Description=netusage network consumption collector
+Documentation=file:///opt/netusage/README.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=__PYTHON__ /opt/netusage/collector.py
+Restart=always
+RestartSec=5
+Nice=10
+IOSchedulingClass=idle
+StateDirectory=netusage
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

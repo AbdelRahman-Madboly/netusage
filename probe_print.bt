@@ -1,0 +1,21 @@
+#!/usr/bin/env bpftrace
+/*
+ * Fallback for bpftrace builds without map for-loops.
+ * Relies on the default map print format:  @tx[<pid>, <comm>]: <bytes>
+ * See probe_for.bt for why the receive paths are cast to int32.
+ */
+
+kprobe:tcp_sendmsg      { @tx[pid, comm] = sum(arg2); }
+kprobe:udp_sendmsg      { @tx[pid, comm] = sum(arg2); }
+
+kprobe:tcp_cleanup_rbuf /(int32)arg1 > 0/    { @rx[pid, comm] = sum((int32)arg1); }
+kretprobe:udp_recvmsg   /(int32)retval > 0/  { @rx[pid, comm] = sum((int32)retval); }
+
+interval:s:__INTERVAL__ {
+        print(@tx);
+        print(@rx);
+        clear(@tx);
+        clear(@rx);
+}
+
+END { clear(@tx); clear(@rx); }

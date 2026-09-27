@@ -1,0 +1,183 @@
+# netusage
+
+Tracks how much internet this laptop consumes over a billing cycle that runs
+from the 25th of one month to the 25th of the next, broken down by application.
+
+A background service collects continuously; a terminal command reports on
+demand. The service is independent of any terminal, starts at boot, and
+restarts itself if it dies.
+
+Design decisions, the bug log and open items are in `NOTES.md`.
+
+## Install
+
+```sh
+sudo ./install.sh
+```
+
+Installs `vnstat`, `bpftrace` and `nethogs`, copies the program to
+`/opt/netusage`, registers the `netusage` systemd service, and links the
+`netusage` command into `/usr/local/bin`. Re-run it any time to update.
+
+## Use
+
+```sh
+netusage           # cycle total, today, daily average, top applications
+netusage today     # today only, by application
+netusage apps      # every application this cycle
+netusage days      # per-day table for this cycle
+netusage cycles    # previous billing cycles
+netusage status    # collector health and which backend is active
+netusage live      # live throughput, Ctrl-C to stop
+```
+
+`-n N` limits application rows; `-i N` sets the poll interval for `live`.
+
+## Daily limit
+
+The daily limit is 10 GB, set in `/etc/netusage.conf`. When today's usage
+crosses 80%, 100%, 150% and 200% of it, a desktop notification appears; the
+100% one is marked critical so it stays on screen. Each threshold fires at
+most once per day, and which ones have fired is recorded in the database, so
+restarting the service mid-day does not replay notifications you already saw.
+Crossing several thresholds at once produces one notification, not several.
+
+`netusage` and `netusage today` show today's usage against the limit with a
+bar that turns yellow at 80% and red once exceeded.
+
+The collector runs as root, which has no desktop session of its own, so it
+hands the notification to the logged-in user's D-Bus session explicitly. If
+nobody is logged in, the threshold is still recorded and simply not shown.
+
+Set `daily_limit_gb = 0` to switch notifications off while still tracking
+usage. The limit is a warning only; nothing is throttled or blocked.
+
+## How the numbers are produced
+
+**The headline total** comes from the kernel's own byte counters for physical
+network interfaces, read every 10 seconds and stored as per-day deltas.
+
+- It does not matter which WiFi network you are on. Home, a phone hotspot, a
+  café — all of it lands in the same total, because the counter belongs to the
+  interface, not the network.
+- Only physical interfaces are counted. This machine has around 23 virtual
+  ones (`docker0`, `br-*`, `veth*`, `tailscale0`); counting those would inflate
+  the total badly, and Tailscale in particular would be counted twice since its
+  traffic already rides over the WiFi adapter. Physical interfaces are
+  identified by the presence of `/sys/class/net/<name>/device`.
+- Reboots are handled: the last raw counter value is checkpointed to the
+  database, so when a counter restarts from zero the collector recognises the
+  reset instead of recording a huge negative or losing the day.
+
+**The per-application breakdown** comes from eBPF kprobes on the socket
+send/receive paths (`tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp_sendmsg`,
+`udp_recvmsg`), aggregated inside the kernel and dumped every 10 seconds.
+Because this sits at the socket layer rather than sniffing packets, it sees
+QUIC, UDP and short-lived connections that a pcap-based tool misses.
+
+These two numbers do not match exactly, and are not meant to. Per-app figures
+are payload bytes: they exclude TCP/IP headers, TLS framing and retransmits,
+so they typically account for 90-95% of the interface total. `netusage` prints
+the coverage percentage so the gap is always visible. **The interface total is
+the number to trust for consumption**; the per-app figures show the split.
+
+Sizes use 1024-based units, the same convention `vnstat` and most Linux tools
+use. If your provider quotes GB as 1,000,000,000 bytes, their figure will read
+about 7% higher than this one.
+
+## Backends
+
+Per-application accounting picks the first that works:
+
+1. `probe_for.bt` — eBPF iterating the map with `for`, which needs
+   **bpftrace 0.21**. Ubuntu 24.04 ships 0.20.2, so this is skipped here: the
+   installed version is checked first rather than attempted and logged as a
+   syntax error on every start.
+2. `probe_print.bt` — eBPF using the map print format. **This is the one in
+   use on this machine.**
+3. `nethogs` — pcap-based fallback
+
+`netusage status` reports which is active. If all fail, the interface total
+still works: it does not depend on eBPF at all.
+
+## Configuration
+
+`/etc/netusage.conf`:
+
+```ini
+[general]
+interfaces     = auto      ; or a comma-separated list
+cycle_day      = 25        ; day of month the billing cycle starts
+interval       = 10        ; seconds between samples
+db             = /var/lib/netusage/netusage.db
+backend        = auto      ; auto | ebpf | nethogs | off
+daily_limit_gb = 10        ; 0 disables notifications
+notify_at      = 80,100,150,200
+```
+
+After editing: `sudo systemctl restart netusage`.
+
+Changing `cycle_day` re-slices existing history rather than discarding it,
+because usage is stored per day and the cycle is only a date range over it.
+
+## Service
+
+```sh
+systemctl status netusage      # is it running
+journalctl -u netusage -f      # what is it doing
+sudo systemctl restart netusage
+```
+
+`vnstat` is installed alongside as an independent cross-check on the interface
+totals (`vnstat -m`); nothing in netusage depends on it.
+
+## Files
+
+| Path | Purpose |
+| --- | --- |
+| `/opt/netusage/` | installed program |
+| `/etc/netusage.conf` | configuration |
+| `/var/lib/netusage/netusage.db` | usage history (SQLite) |
+| `/etc/systemd/system/netusage.service` | service unit |
+| `/usr/local/bin/netusage` | the command |
+
+## Uninstall
+
+```sh
+sudo ./uninstall.sh            # keeps the database
+sudo ./uninstall.sh --purge    # deletes it too
+```
+
+## A note on probe widths
+
+The kernel receive paths (`tcp_cleanup_rbuf`, `udp_recvmsg`) hand back a
+32-bit `int`. Reading those as 64-bit values picks up whatever the caller left
+in the high word, which yields byte counts that are exact multiples of 2^32 -
+figures like "376.00 GB" appearing within minutes of starting. Both are cast
+to `int32` before use. The send paths take a `size_t` and need no cast, which
+is why upload figures were correct while downloads were not.
+
+As a backstop, any single batch claiming more than 64 GiB for one process is
+discarded rather than recorded, so a future kernel ABI change degrades into
+missing data instead of nonsense totals.
+
+## Cost
+
+Roughly 0.2% of one CPU core, with bpftrace accounting for most of it. The
+collector wakes once per `interval`, writes a handful of rows and goes back to
+sleep; it is niced and set to idle I/O priority so it yields to anything else
+wanting the disk.
+
+`python3 test_netusage.py` includes a check that the collector stays under 5%
+of a core, because a busy loop here is invisible in the recorded totals — the
+numbers stay correct while the CPU burns.
+
+## Limitations
+
+- Traffic inside a Docker container is attributed to the container's process
+  as seen from the host, so several containers may aggregate under `docker`.
+- Per-app attribution needs the process to still exist when a batch is
+  flushed. A process that sends data and exits within the same 10-second
+  window is recorded under its kernel `comm` name rather than a full one.
+- The collector claims no traffic for an interface the first time it sees it,
+  since the counter already holds history it cannot attribute to this cycle.

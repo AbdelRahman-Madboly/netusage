@@ -1,0 +1,27 @@
+#!/usr/bin/env bpftrace
+/*
+ * Per-process socket byte accounting.
+ * Aggregates in kernel maps, dumps a plain-text batch every __INTERVAL__ seconds.
+ * Emitted format:  "T <pid> <comm> <bytes>" / "R <pid> <comm> <bytes>" then "E"
+ *
+ * The receive paths hand back a 32-bit int. Reading those as 64 bits picks up
+ * whatever the caller left in the high word, which produces byte counts that
+ * are exact multiples of 2^32, so both are cast to int32 before use. The send
+ * paths take a size_t and need no cast.
+ */
+
+kprobe:tcp_sendmsg      { @tx[pid, comm] = sum(arg2); }
+kprobe:udp_sendmsg      { @tx[pid, comm] = sum(arg2); }
+
+kprobe:tcp_cleanup_rbuf /(int32)arg1 > 0/    { @rx[pid, comm] = sum((int32)arg1); }
+kretprobe:udp_recvmsg   /(int32)retval > 0/  { @rx[pid, comm] = sum((int32)retval); }
+
+interval:s:__INTERVAL__ {
+        for ($kv : @tx) { $k = $kv.0; printf("T %d %s %llu\n", $k.0, $k.1, $kv.1); }
+        for ($kv : @rx) { $k = $kv.0; printf("R %d %s %llu\n", $k.0, $k.1, $kv.1); }
+        clear(@tx);
+        clear(@rx);
+        printf("E\n");
+}
+
+END { clear(@tx); clear(@rx); }

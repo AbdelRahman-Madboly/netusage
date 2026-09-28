@@ -358,6 +358,7 @@ def cmd_status(db, cfg, args):
         state = YELLOW("no heartbeat yet")
     backend = meta(db, "backend", "unknown")
     backend_label = {
+        "probe_filtered.bt": "eBPF (kprobes, physical NICs only)",
         "probe_for.bt": "eBPF (kprobes, map iteration)",
         "probe_print.bt": "eBPF (kprobes, print fallback)",
         "nethogs": "nethogs (pcap fallback)",
@@ -369,11 +370,25 @@ def cmd_status(db, cfg, args):
     if backend in ("failed", "off"):
         backend_label = YELLOW(backend_label)
     print(f"  per-app        {backend_label}")
+    since = meta(db, "app_filter_since")
+    if since:
+        print(f"  local filter   since {since} "
+              f"{DIM('(earlier per-app days include local traffic)')}")
     print(f"  interfaces     {meta(db, 'interfaces', '?')}")
     print(f"  cycle day      {meta(db, 'cycle_day', cfg['cycle_day'])}")
     raw = meta(db, "daily_limit_bytes")
     limit = int(raw) if raw and raw.isdigit() else 0
-    print(f"  daily limit    {human(limit) + ' (notifies at 80/100/150/200%)' if limit else 'not set'}")
+    points = (meta(db, "notify_at") or "").replace(",", "/")
+    note = f" (notifies at {points}%)" if points else ""
+    print(f"  daily limit    {human(limit) + note if limit else 'not set'}")
+    raw = meta(db, "cycle_limit_bytes")
+    plan = int(raw) if raw and raw.isdigit() else 0
+    if plan:
+        cpoints = (meta(db, "cycle_notify_at") or "").replace(",", "/")
+        print(f"  data plan      {human(plan)}" + (f" (notifies at {cpoints}%)" if cpoints else ""))
+    raw = meta(db, "remind_minutes")
+    if raw and raw.isdigit() and int(raw):
+        print(f"  reminders      every {raw} min while over a limit")
     print(f"  database       {cfg['db']}")
     row = db.execute("SELECT MIN(day), MAX(day), COUNT(DISTINCT day) "
                      "FROM iface_daily").fetchone()

@@ -2,6 +2,7 @@
 """Tests for netusage. Run: python3 test_netusage.py  (no root needed)"""
 
 import os
+import re
 import sys
 import tempfile
 from datetime import date
@@ -80,6 +81,80 @@ def test_counters():
     os.unlink(path)
 
 
+def test_hourly():
+    print("\n== hourly interface rows ==")
+    path = tempfile.mktemp(suffix=".db")
+    store = collector.Store(path)
+    sampler = collector.InterfaceSampler(store, ["test0"])
+    seq = []
+    collector.read_counter = lambda i: seq.pop(0)
+
+    seq[:] = [(1000, 500)]
+    sampler.sample("2026-09-28", "2026-09-28 13")      # first sight
+    seq[:] = [(1600, 700)]
+    sampler.sample("2026-09-28", "2026-09-28 14")
+    seq[:] = [(1900, 800)]
+    sampler.sample("2026-09-28", "2026-09-28 14")      # same hour accumulates
+    seq[:] = [(2000, 850)]
+    sampler.sample("2026-09-28")                        # hour derived from day
+    store.commit()
+
+    rows = {h: (r, t) for h, i, r, t in
+            store.db.execute("SELECT hour, iface, rx, tx FROM iface_hourly")}
+    check("first sight writes no hour", "2026-09-28 13" in rows, False)
+    check("hour key and sums", rows.get("2026-09-28 14"), (900, 300))
+    derived = [h for h in rows if h != "2026-09-28 14"]
+    check("derived hour key format",
+          len(derived) == 1 and bool(re.match(r"^2026-09-28 \d\d$", derived[0])),
+          True)
+    day = store.db.execute(
+        "SELECT rx, tx FROM iface_daily WHERE day='2026-09-28'").fetchone()
+    hours = store.db.execute(
+        "SELECT SUM(rx), SUM(tx) FROM iface_hourly "
+        "WHERE hour LIKE '2026-09-28 %'").fetchone()
+    check("hours sum to the day", hours, day)
+    os.unlink(path)
+
+
+def test_probes():
+    print("\n== probe selection and rendering ==")
+    real_version = collector._bpftrace_version
+    try:
+        collector._bpftrace_version = lambda: (0, 20)
+        check("0.20: filtered, then print", collector._probe_sources(),
+              ["probe_filtered.bt", "probe_print.bt"])
+        collector._bpftrace_version = lambda: (0, 21)
+        check("0.21: filtered, for, print", collector._probe_sources(),
+              ["probe_filtered.bt", "probe_for.bt", "probe_print.bt"])
+        check("no ifindex: unfiltered only",
+              collector._probe_sources(filtered=False),
+              ["probe_for.bt", "probe_print.bt"])
+    finally:
+        collector._bpftrace_version = real_version
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "probe_filtered.bt")) as f:
+        source = f.read()
+    text = collector.render_probe(source, 10, [2, 3])
+    check("ifindex test substituted",
+          text.count("if ($idx == 2 || $idx == 3) { $keep = 1; }"), 4)
+    check("interval substituted", "interval:s:10 {" in text, True)
+    check("no placeholder left", re.findall(r"__[A-Z_]+__", text), [])
+    check("udp recv stash is deleted", text.count("delete(@u"), 2)
+    try:
+        collector.render_probe(source, 10, [])
+        refused = False
+    except ValueError:
+        refused = True
+    check("filtered probe refuses an empty ifindex list", refused, True)
+    with open(os.path.join(here, "probe_print.bt")) as f:
+        check("unfiltered probe ignores ifindexes",
+              collector.render_probe(f.read(), 5, [2]).count("interval:s:5"), 1)
+
+    check("ifindex read from sysfs",
+          collector.interface_indexes(["lo", "no-such-if0"]), [1])
+
+
 def test_classify():
     print("\n== process naming ==")
     case([], "cpuhp/2", "cpuhp/2")
@@ -99,6 +174,14 @@ def test_classify():
     case(["python3.12"], "python3", "python3")
     case(["/usr/bin/ssh", "host"], "ssh", "ssh")
     case(["/usr/bin/qemu-system-x86_64"], "qemu", "qemu-system-x86_64")
+    case(["/home/u/.local/share/assistant/versions/2.1.260", "--print"],
+         "2.1.260", "assistant-cli")
+    case(["/opt/tool/versions/1.4/tool-agent"], "tool-agent", "tool-agent")
+    case(["/opt/acme/releases/3.2.1"], "3.2.1", "acme")
+    case(["node", "/home/u/.cache/foo/versions/1.2.3/index.js"], "node", "foo")
+    case([], "Chrome_ChildIOT", "chrome")
+    case([], "chrome_crashpad", "chrome")
+    case([], "kworker/0:1", "kworker/0:1")
 
 
 def test_live_processes():
@@ -170,6 +253,69 @@ def test_notifier():
     os.unlink(path)
 
 
+def test_limits():
+    print("\n== limits set from the dashboard ==")
+    import tempfile
+    GB = 1024 ** 3
+    base = {"daily_limit_gb": 10.0, "notify_at": [80, 100]}
+    path = tempfile.mktemp(suffix=".conf")
+    lim = collector.load_limits(base, path)
+    check("no limits file keeps the conf values",
+          (lim["daily_limit_bytes"], lim["notify_at"], lim["cycle_limit_bytes"]),
+          (10 * GB, [80, 100], 0))
+    with open(path, "w") as f:
+        f.write("[limits]\ndaily_limit_gb = 2.5\nnotify_at = 50, 100\n"
+                "cycle_limit_gb = 100\ncycle_notify_at = 90,100\nremind_every_min = 30\n")
+    lim = collector.load_limits(base, path)
+    check("limits file overrides", (lim["daily_limit_bytes"], lim["notify_at"],
+                                    lim["cycle_limit_bytes"], lim["cycle_notify_at"],
+                                    lim["remind_minutes"]),
+          (int(2.5 * GB), [50, 100], 100 * GB, [90, 100], 30))
+    with open(path, "w") as f:
+        f.write("[limits]\ndaily_limit_gb = lots\n")
+    check("an unparsable file is ignored whole",
+          collector.load_limits(base, path)["daily_limit_bytes"], 10 * GB)
+    os.unlink(path)
+
+    sent = []
+    collector.notify = lambda t, b, u="normal": sent.append((t, u)) or True
+    dbpath = tempfile.mktemp(suffix=".db")
+    store = collector.Store(dbpath)
+    clock = [1000.0]
+    n = collector.LimitNotifier(store, 10 * GB, [80, 100], remind_minutes=30,
+                                scope="day", clock=lambda: clock[0])
+    n.check("2026-10-01", 11 * GB)
+    check("crossing the limit notifies once", len(sent), 1)
+    clock[0] += 10 * 60
+    n.check("2026-10-01", 11 * GB)
+    check("no reminder before the interval", len(sent), 1)
+    clock[0] += 21 * 60
+    n.check("2026-10-01", 12 * GB)
+    check("reminder after the interval", len(sent), 2)
+    check("reminder says still over", sent[-1][0].startswith("Still over"), True)
+    n.check("2026-10-01", 12 * GB)
+    check("reminder does not repeat at once", len(sent), 2)
+
+    raised = collector.LimitNotifier(store, 20 * GB, [80, 100], scope="day",
+                                     clock=lambda: clock[0])
+    raised.check("2026-10-01", 12 * GB)
+    check("a raised limit is not already exceeded", len(sent), 2)
+    raised.check("2026-10-01", 16 * GB)
+    check("a changed limit re-arms its thresholds", len(sent), 3)
+
+    cyc = collector.LimitNotifier(store, 100 * GB, [90, 100], scope="cycle",
+                                  clock=lambda: clock[0])
+    cyc.check("2026-09-25", 95 * GB)
+    check("cycle limit notifies", sent[-1][0], "Data usage at 90% of your data plan")
+    cyc.check("2026-09-25", 96 * GB)
+    check("cycle threshold fires once", len(sent), 4)
+    check("cycle start mid-cycle", collector.cycle_start(date(2026, 10, 3), 25),
+          date(2026, 9, 25))
+    check("cycle start in january", collector.cycle_start(date(2027, 1, 3), 25),
+          date(2026, 12, 25))
+    os.unlink(dbpath)
+
+
 def test_loop_paces():
     """The main loop must sleep between samples rather than spin.
 
@@ -220,9 +366,12 @@ def test_formatting():
 if __name__ == "__main__":
     test_cycles()
     test_counters()
+    test_hourly()
+    test_probes()
     test_classify()
     test_live_processes()
     test_notifier()
+    test_limits()
     test_loop_paces()
     test_formatting()
     print("\n" + ("ALL TESTS PASSED" if not FAILS

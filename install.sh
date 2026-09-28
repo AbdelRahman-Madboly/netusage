@@ -45,11 +45,42 @@ say "installing to $DEST"
 install -d -m 0755 "$DEST"
 install -m 0755 "$SRC/collector.py" "$DEST/collector.py"
 install -m 0755 "$SRC/cli.py"       "$DEST/cli.py"
-install -m 0644 "$SRC/probe_for.bt" "$DEST/probe_for.bt"
-install -m 0644 "$SRC/probe_print.bt" "$DEST/probe_print.bt"
+for probe in "$SRC"/probe_*.bt; do
+    install -m 0644 "$probe" "$DEST/$(basename "$probe")"
+done
 [ -f "$SRC/README.md" ] && install -m 0644 "$SRC/README.md" "$DEST/README.md"
 
 install -d -m 0755 /var/lib/netusage
+
+# Limits the dashboard can change without root. Owned by the desktop user;
+# the collector only ever reads it and re-reads it when it changes.
+LIMITS=/var/lib/netusage/limits.conf
+OWNER="${SUDO_USER:-$(logname 2>/dev/null || true)}"
+if [ ! -f "$LIMITS" ]; then
+    say "writing $LIMITS"
+    limit=$(sed -n 's/^[[:space:]]*daily_limit_gb[[:space:]]*=[[:space:]]*\([0-9.]*\).*/\1/p' "$SRC/netusage.conf" "$CONF" 2>/dev/null | tail -1)
+    notify=$(sed -n 's/^[[:space:]]*notify_at[[:space:]]*=[[:space:]]*\([0-9, ]*\).*/\1/p' "$SRC/netusage.conf" "$CONF" 2>/dev/null | tail -1)
+    plan=0
+    if [ -n "$OWNER" ]; then
+        home=$(getent passwd "$OWNER" | cut -d: -f6)
+        dash="$home/.config/netusage/dashboard.json"
+        [ -f "$dash" ] && plan=$("$PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("plan_gb", 0) or 0)' "$dash" 2>/dev/null || echo 0)
+    fi
+    cat > "$LIMITS" <<LIMEOF
+# Notification limits. Edited by the Net Usage dashboard (Preferences);
+# the collector picks up changes within one interval, no restart needed.
+[limits]
+daily_limit_gb = ${limit:-10}
+notify_at = ${notify:-80,100,150,200}
+cycle_limit_gb = ${plan}
+cycle_notify_at = 75,90,100
+remind_every_min = 0
+LIMEOF
+fi
+if [ -n "$OWNER" ] && [ "$OWNER" != root ]; then
+    chown "$OWNER" "$LIMITS"
+fi
+chmod 0644 "$LIMITS"
 
 if [ -f "$CONF" ]; then
     say "keeping existing $CONF"
@@ -81,20 +112,51 @@ say "CLI linked at $BIN"
 # Per-app rows written before the receive probes were width-corrected can hold
 # impossible values (exact multiples of 2^32). Drop any day whose per-app total
 # exceeds twice what the interface actually carried; payload can never do that.
+#
+# This does not undo the loopback problem: before probe_filtered.bt, per-app
+# rows also counted loopback, docker bridge and tailscale traffic. Those bytes
+# cannot be separated out after the fact, so days under the 2x line are kept
+# as they are. The collector records the first day the filtered probe ran in
+# meta `app_filter_since`, and anything earlier should be read with that in
+# mind.
 if [ -f /var/lib/netusage/netusage.db ]; then
     "$PYTHON" - <<'PYFIX'
 import sqlite3
 db = sqlite3.connect("/var/lib/netusage/netusage.db", timeout=15)
 db.execute("PRAGMA busy_timeout = 10000")
+# The width bug was fixed on 31 Aug 2026, so only days up to then can hold
+# its values. Later days can also exceed 2x (local traffic, see above), and
+# deleting those would throw away real per-app history on every reinstall.
 bad = [r[0] for r in db.execute("""
     SELECT a.day FROM (SELECT day, SUM(rx+tx) t FROM app_daily GROUP BY day) a
     JOIN (SELECT day, SUM(rx+tx) t FROM iface_daily GROUP BY day) i
-      ON a.day = i.day WHERE a.t > i.t * 2 """)]
+      ON a.day = i.day WHERE a.t > i.t * 2 AND a.day <= '2026-08-31' """)]
 for day in bad:
     db.execute("DELETE FROM app_daily WHERE day = ?", (day,))
-db.commit()
 if bad:
     print(f"==> repaired per-app data for: {', '.join(bad)}")
+
+# Older collectors recorded two names the classifier now resolves: the
+# versioned assistant-cli binary (~/.local/share/assistant/versions/2.1.260) under
+# its version number, and Chrome threads under their thread name once the
+# process had exited. Fold those rows into the names used from now on.
+import re
+renames = {}
+for (app,) in db.execute("SELECT DISTINCT app FROM app_daily"):
+    if re.fullmatch(r"\d+(\.\d+)+", app):
+        renames[app] = "assistant-cli"
+    elif app.startswith(("Chrome_", "chrome_")):
+        renames[app] = "chrome"
+for old, new in renames.items():
+    db.execute("""
+        INSERT INTO app_daily(day, app, rx, tx)
+        SELECT day, ?, rx, tx FROM app_daily WHERE app = ?
+        ON CONFLICT(day, app) DO UPDATE SET rx = rx + excluded.rx, tx = tx + excluded.tx
+    """, (new, old))
+    db.execute("DELETE FROM app_daily WHERE app = ?", (old,))
+if renames:
+    print(f"==> merged {len(renames)} legacy app name(s): {', '.join(sorted(renames))}")
+db.commit()
 PYFIX
 fi
 

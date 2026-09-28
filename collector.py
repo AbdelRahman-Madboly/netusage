@@ -11,8 +11,10 @@ Runs as a systemd service. Two independent jobs:
 
   2. Per-process accounting - attributes bytes to a process name using eBPF
      kprobes on the socket send/receive paths (falls back to nethogs, then to
-     disabled). These are payload bytes, so they sum to slightly less than the
-     interface total; they are a breakdown, not the headline figure.
+     disabled). Only sockets routed through the counted NICs are kept, so
+     loopback, docker bridge and tunnel traffic stay out. These are payload
+     bytes, so they sum to slightly less than the interface total; they are a
+     breakdown, not the headline figure.
 """
 
 import configparser
@@ -24,9 +26,12 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
 
 CONF_PATH = os.environ.get("NETUSAGE_CONF", "/etc/netusage.conf")
+# Limits the desktop user may change from the dashboard without root. The
+# installer makes it owned by that user; values here override the conf file.
+LIMITS_PATH = os.environ.get("NETUSAGE_LIMITS", "/var/lib/netusage/limits.conf")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULTS = {
@@ -67,6 +72,61 @@ def load_config():
     return cfg
 
 
+def _percent_list(raw):
+    return sorted({int(p) for p in str(raw).replace(" ", "").split(",")
+                   if p.strip().isdigit() and 0 < int(p) <= 1000})
+
+
+def load_limits(cfg, path=None):
+    """Notification limits: the conf file's, overridden by the limits file.
+
+    A limits file that cannot be read or parsed is ignored as a whole rather
+    than half-applied, so a save caught mid-write keeps the previous values.
+    """
+    limits = {
+        "daily_limit_bytes": int(cfg["daily_limit_gb"] * 1024 ** 3),
+        "notify_at": list(cfg["notify_at"]),
+        "cycle_limit_bytes": 0,
+        "cycle_notify_at": [75, 90, 100],
+        "remind_minutes": 0,
+    }
+    path = path or LIMITS_PATH
+    parser = configparser.ConfigParser()
+    try:
+        with open(path) as f:
+            parser.read_file(f)
+    except (OSError, configparser.Error):
+        return limits
+    if not parser.has_section("limits"):
+        return limits
+    sec = parser["limits"]
+    try:
+        update = {}
+        if "daily_limit_gb" in sec:
+            update["daily_limit_bytes"] = int(max(0.0, float(sec["daily_limit_gb"])) * 1024 ** 3)
+        if "notify_at" in sec:
+            update["notify_at"] = _percent_list(sec["notify_at"])
+        if "cycle_limit_gb" in sec:
+            update["cycle_limit_bytes"] = int(max(0.0, float(sec["cycle_limit_gb"])) * 1024 ** 3)
+        if "cycle_notify_at" in sec:
+            update["cycle_notify_at"] = _percent_list(sec["cycle_notify_at"])
+        if "remind_every_min" in sec:
+            update["remind_minutes"] = max(0, int(float(sec["remind_every_min"])))
+    except ValueError:
+        return limits
+    limits.update(update)
+    return limits
+
+
+def cycle_start(today, cycle_day):
+    """First day of the billing cycle containing `today`."""
+    if today.day >= cycle_day:
+        return date(today.year, today.month, cycle_day)
+    if today.month > 1:
+        return date(today.year, today.month - 1, cycle_day)
+    return date(today.year - 1, 12, cycle_day)
+
+
 def physical_interfaces():
     """Physical NICs only: a /device link excludes bridges, veth, tun and lo."""
     found = []
@@ -95,6 +155,13 @@ CREATE TABLE IF NOT EXISTS iface_daily (
     rx    INTEGER NOT NULL DEFAULT 0,
     tx    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, iface)
+);
+CREATE TABLE IF NOT EXISTS iface_hourly (
+    hour  TEXT    NOT NULL,
+    iface TEXT    NOT NULL,
+    rx    INTEGER NOT NULL DEFAULT 0,
+    tx    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour, iface)
 );
 CREATE TABLE IF NOT EXISTS app_daily (
     day TEXT    NOT NULL,
@@ -159,6 +226,17 @@ class Store:
             (day, iface, rx, tx),
         )
 
+    def add_iface_hourly(self, hour, iface, rx, tx):
+        """hour is local time as 'YYYY-MM-DD HH'; the dashboard reads it as-is."""
+        if rx == 0 and tx == 0:
+            return
+        self.db.execute(
+            "INSERT INTO iface_hourly(hour, iface, rx, tx) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(hour, iface) DO UPDATE SET rx = rx + excluded.rx, "
+            "tx = tx + excluded.tx",
+            (hour, iface, rx, tx),
+        )
+
     def add_app(self, day, app, rx, tx):
         if rx == 0 and tx == 0:
             return
@@ -207,7 +285,11 @@ class InterfaceSampler:
         self.interfaces = interfaces
         self.last = store.load_counters()
 
-    def sample(self, day):
+    def sample(self, day, hour=None):
+        # The hour key must name the same day as `day`, so it is built from it
+        # when the caller does not supply one.
+        if hour is None:
+            hour = f"{day} {datetime.now():%H}"
         for iface in self.interfaces:
             current = read_counter(iface)
             if current is None:
@@ -226,6 +308,7 @@ class InterfaceSampler:
                 d_rx, d_tx = rx - prev[0], tx - prev[1]
             self.last[iface] = (rx, tx)
             self.store.add_iface(day, iface, d_rx, d_tx)
+            self.store.add_iface_hourly(hour, iface, d_rx, d_tx)
             self.store.save_counter(iface, rx, tx)
 
 
@@ -299,6 +382,27 @@ GENERIC_DIRS = {"bin", ".bin", "src", "lib", "dist", "build", "out",
 
 _STRIP_SUFFIX = re.compile(r"(\.bin|-real|-wrapper|\.sh|\.js|\.py|\.ts)$")
 
+# Versioned installs run a binary named after its version
+# (~/.local/share/assistant/versions/2.1.260). The name is the directory above.
+_VERSION = re.compile(r"^\d+(\.\d+)+$")
+VERSION_DIRS = {"versions", "version", "releases"}
+
+# With the process gone, only the kernel comm is left. Chrome names its
+# threads "Chrome_ChildIOThread" and similar, which the kernel truncates to
+# 15 characters. Electron apps share those thread names, so this is a best
+# guess, used only when there is no command line to go on.
+COMM_PREFIXES = (("Chrome_", "chrome"), ("chrome_", "chrome"))
+
+
+def _named_parent(path):
+    """Nearest directory above `path` that identifies something, or None."""
+    for parent in reversed(os.path.dirname(path).strip("/").split("/")):
+        low = parent.lower()
+        if (parent and low not in GENERIC_DIRS and low not in VERSION_DIRS
+                and not _VERSION.match(parent)):
+            return parent
+    return None
+
 
 def _script_name(argv):
     """For an interpreter invocation, name the thing being interpreted."""
@@ -308,11 +412,11 @@ def _script_name(argv):
         base = _STRIP_SUFFIX.sub("", os.path.basename(arg.rstrip("/")))
         if not base:
             continue
-        if base.lower() in GENERIC_SCRIPTS:
+        if base.lower() in GENERIC_SCRIPTS or _VERSION.match(base):
             # "server/index.js" says nothing; the directory above it does.
-            for parent in reversed(os.path.dirname(arg).strip("/").split("/")):
-                if parent and parent.lower() not in GENERIC_DIRS:
-                    return parent
+            parent = _named_parent(arg)
+            if parent:
+                return parent
         return base
     return None
 
@@ -323,6 +427,9 @@ def classify(pid, comm):
     # Kernel threads have no command line. Their comm uses a "name/cpu"
     # convention where the slash is part of the name, not a path separator.
     if not argv:
+        for prefix, label in COMM_PREFIXES:
+            if comm and comm.startswith(prefix):
+                return label
         return (comm or "unknown")[:40]
 
     joined = " ".join(argv)
@@ -331,6 +438,8 @@ def classify(pid, comm):
     # Some daemons rewrite argv[0] into a status line ("postgres: walwriter").
     head = argv[0].split()[0].rstrip(":") if argv[0].strip() else ""
     exe = os.path.basename(head)
+    if _VERSION.match(exe):
+        exe = _named_parent(head) or exe
 
     alias = EXE_ALIASES.get(exe.lower())
     if alias:
@@ -415,8 +524,16 @@ def _bpftrace_version():
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def _probe_sources():
+FILTERED_PROBE = "probe_filtered.bt"
+
+
+def _probe_sources(filtered=True):
     """Probe scripts to try, best first.
+
+    probe_filtered.bt counts only traffic routed through the counted physical
+    interfaces, so it leads whenever their indexes are known. It reads kernel
+    structs the other two do not, so if it fails to attach the unfiltered
+    probes remain behind it.
 
     Iterating a map with `for` needs bpftrace 0.21. Offering it to an older
     build only produces a syntax error in the log on every start, so it is
@@ -424,8 +541,33 @@ def _probe_sources():
     """
     version = _bpftrace_version()
     if version is None or version >= (0, 21):
-        return ["probe_for.bt", "probe_print.bt"]
-    return ["probe_print.bt"]
+        sources = ["probe_for.bt", "probe_print.bt"]
+    else:
+        sources = ["probe_print.bt"]
+    return ([FILTERED_PROBE] if filtered else []) + sources
+
+
+def interface_indexes(interfaces):
+    """Kernel ifindex of each interface that currently exists."""
+    found = []
+    for iface in interfaces:
+        try:
+            with open(f"/sys/class/net/{iface}/ifindex") as f:
+                found.append(int(f.read()))
+        except (OSError, ValueError):
+            continue
+    return sorted(set(found))
+
+
+def render_probe(text, interval, ifindexes=()):
+    """Fill in a probe script's placeholders."""
+    text = text.replace("__INTERVAL__", str(interval))
+    if "__IFINDEX_TEST__" in text:
+        if not ifindexes:
+            raise ValueError("filtered probe needs at least one ifindex")
+        test = " || ".join(f"$idx == {int(i)}" for i in ifindexes)
+        text = text.replace("__IFINDEX_TEST__", test)
+    return text
 
 
 def _error_lines(text, limit=4):
@@ -442,11 +584,14 @@ class EbpfBackend(threading.Thread):
 
     daemon = True
 
-    def __init__(self, accumulator, names, interval):
+    def __init__(self, accumulator, names, interval, interfaces=()):
         super().__init__(name="ebpf")
         self.acc = accumulator
         self.names = names
         self.interval = interval
+        # Resolved once, like the interface list itself: an adapter plugged
+        # in later is not in the filter until the service restarts.
+        self.ifindexes = interface_indexes(interfaces)
         self.stop = threading.Event()
         self.proc = None
         self.source = None
@@ -469,8 +614,8 @@ class EbpfBackend(threading.Thread):
         return "starting"
 
     def _script(self, source):
-        text = open(os.path.join(HERE, source)).read()
-        text = text.replace("__INTERVAL__", str(self.interval))
+        with open(os.path.join(HERE, source)) as f:
+            text = render_probe(f.read(), self.interval, self.ifindexes)
         path = f"/run/netusage-{source}"
         try:
             with open(path, "w") as f:
@@ -524,7 +669,11 @@ class EbpfBackend(threading.Thread):
         return produced
 
     def run(self):
-        sources = _probe_sources()
+        sources = _probe_sources(filtered=bool(self.ifindexes) and
+                                 os.path.exists(os.path.join(HERE, FILTERED_PROBE)))
+        if FILTERED_PROBE in sources:
+            log(f"filtering per-app traffic to ifindex "
+                f"{', '.join(str(i) for i in self.ifindexes)}")
         index = 0
         while not self.stop.is_set():
             source = sources[min(index, len(sources) - 1)]
@@ -629,7 +778,7 @@ def start_backend(cfg, accumulator, names, interfaces):
         for p in os.environ.get("PATH", "/usr/bin:/usr/sbin").split(":")
     )
     if choice in ("auto", "ebpf") and have_bpftrace:
-        backend = EbpfBackend(accumulator, names, cfg["interval"])
+        backend = EbpfBackend(accumulator, names, cfg["interval"], interfaces)
     elif choice in ("auto", "nethogs"):
         backend = NethogsBackend(accumulator, names, cfg["interval"], interfaces)
     else:
@@ -686,7 +835,7 @@ def notify(title, body, urgency="normal"):
             try:
                 result = subprocess.run(
                     launcher + ["notify-send", "-a", "netusage",
-                                "-u", urgency, "-i", "network-wireless",
+                                "-u", urgency, "-i", "com.madboly.NetUsage",
                                 title, body],
                     env=env, timeout=10,
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -707,49 +856,147 @@ def human(num):
     return f"{int(num)} B"
 
 
-class DailyLimitNotifier:
-    """Fires once per threshold per day when today's usage crosses it.
+class LimitNotifier:
+    """Fires once per threshold per period when usage crosses it.
 
+    `scope` is "day" (key: the date) or "cycle" (key: the cycle's first day).
     Which thresholds have fired is kept in the database, not in memory, so a
-    restart mid-day does not replay notifications the user already saw.
+    restart does not replay notifications the user already saw. Changing the
+    limit starts the record afresh, since 80% of a new limit is a new event.
+
+    With `remind_minutes` set, being over the limit repeats a reminder at
+    that interval until the period ends.
     """
 
-    def __init__(self, store, limit_bytes, thresholds):
+    def __init__(self, store, limit_bytes, thresholds, remind_minutes=0,
+                 scope="day", clock=time.time):
         self.store = store
         self.limit = limit_bytes
         self.thresholds = thresholds
+        self.remind = remind_minutes * 60
+        self.scope = scope
+        self.clock = clock
 
-    def _fired(self, day):
-        raw = self.store.get_meta(f"notified:{day}", "") or ""
+    def _key(self, key):
+        # "notified:<day>" predates cycle limits; keep it so history carries over
+        return f"notified:{key}" if self.scope == "day" else f"notified-{self.scope}:{key}"
+
+    def _fired(self, key):
+        stored_limit = self.store.get_meta(self._key(key) + ":limit")
+        if stored_limit is not None and stored_limit != str(self.limit):
+            return set()
+        raw = self.store.get_meta(self._key(key), "") or ""
         return {int(p) for p in raw.split(",") if p.strip().isdigit()}
 
-    def check(self, day, total):
-        if self.limit <= 0 or not self.thresholds:
+    def _text(self, top, used, cap, reminder=False):
+        if self.scope == "day":
+            what, period = "daily limit", "today"
+        else:
+            what, period = "data plan", "this billing cycle"
+        if reminder:
+            return (f"Still over your {what} - {used}",
+                    f"You have used {used} {period}, {top}% of your {cap} {what}.",
+                    "critical")
+        if top >= 100:
+            title = f"{what.capitalize()} reached - {used}"
+            body = (f"You have used {used} {period}, past your {cap} {what}."
+                    if top == 100 else
+                    f"You have used {used} {period} - {top}% of your {cap} {what}.")
+            return title, body, "critical"
+        return (f"Data usage at {top}% of your {what}",
+                f"{used} of {cap} used {period}.", "normal")
+
+    def check(self, key, total):
+        if self.limit <= 0:
             return
-        fired = self._fired(day)
+        now = self.clock()
+        fired = self._fired(key)
         due = [t for t in self.thresholds
                if t not in fired and total >= self.limit * t / 100.0]
-        if not due:
-            return
-        # Only announce the highest threshold crossed, but record them all so
-        # a sudden spike does not produce a burst of notifications.
-        top = max(due)
         used, cap = human(total), human(self.limit)
-        if top >= 100:
-            title = f"Daily data limit reached - {used}"
-            body = (f"You have used {used} today, past your {cap} daily limit."
-                    if top == 100 else
-                    f"You have used {used} today - {top}% of your {cap} limit.")
-            urgency = "critical"
-        else:
-            title = f"Data usage at {top}% of today's limit"
-            body = f"{used} of {cap} used today."
-            urgency = "normal"
+        if due:
+            # Only announce the highest threshold crossed, but record them all
+            # so a sudden spike does not produce a burst of notifications.
+            top = max(due)
+            notify(*self._text(top, used, cap))
+            log(f"notified: {top}% of {self.scope} limit ({used} of {cap})")
+            self.store.set_meta(self._key(key), ",".join(
+                str(t) for t in sorted(fired | set(due))))
+            self.store.set_meta(self._key(key) + ":limit", self.limit)
+            if total >= self.limit:
+                self.store.set_meta(self._key(key) + ":reminded", now)
+            return
+        if self.remind and total >= self.limit:
+            last = float(self.store.get_meta(self._key(key) + ":reminded", 0) or 0)
+            if now - last >= self.remind:
+                pct = int(total * 100 // self.limit)
+                notify(*self._text(pct, used, cap, reminder=True))
+                log(f"reminded: {pct}% of {self.scope} limit ({used} of {cap})")
+                self.store.set_meta(self._key(key) + ":reminded", now)
 
-        notify(title, body, urgency)
-        log(f"notified: {top}% of daily limit ({used} of {cap})")
-        self.store.set_meta(f"notified:{day}", ",".join(
-            str(t) for t in sorted(fired | set(due))))
+
+def DailyLimitNotifier(store, limit_bytes, thresholds, remind_minutes=0):
+    return LimitNotifier(store, limit_bytes, thresholds, remind_minutes, "day")
+
+
+class Limits:
+    """Reloads the limits file when it changes and publishes the result.
+
+    The values go into meta as well, so the CLI and dashboard show what the
+    collector is actually enforcing, not what a file says.
+    """
+
+    def __init__(self, store, cfg):
+        self.store = store
+        self.cfg = cfg
+        self.stamp = None
+        self.daily = self.cycle = None
+        self.reload(force=True)
+
+    def _stamp(self):
+        try:
+            st = os.stat(LIMITS_PATH)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def reload(self, force=False):
+        stamp = self._stamp()
+        if not force and stamp == self.stamp:
+            return False
+        self.stamp = stamp
+        lim = load_limits(self.cfg)
+        self.daily = LimitNotifier(self.store, lim["daily_limit_bytes"], lim["notify_at"],
+                                   lim["remind_minutes"], "day")
+        self.cycle = LimitNotifier(self.store, lim["cycle_limit_bytes"], lim["cycle_notify_at"],
+                                   lim["remind_minutes"], "cycle")
+        for key, value in (("daily_limit_bytes", lim["daily_limit_bytes"]),
+                           ("notify_at", ",".join(map(str, lim["notify_at"]))),
+                           ("cycle_limit_bytes", lim["cycle_limit_bytes"]),
+                           ("cycle_notify_at", ",".join(map(str, lim["cycle_notify_at"]))),
+                           ("remind_minutes", lim["remind_minutes"])):
+            self.store.set_meta(key, value)
+        parts = []
+        if lim["daily_limit_bytes"]:
+            parts.append(f"daily {human(lim['daily_limit_bytes'])} at "
+                         f"{', '.join(str(t) + '%' for t in lim['notify_at'])}")
+        if lim["cycle_limit_bytes"]:
+            parts.append(f"cycle {human(lim['cycle_limit_bytes'])} at "
+                         f"{', '.join(str(t) + '%' for t in lim['cycle_notify_at'])}")
+        if lim["remind_minutes"]:
+            parts.append(f"remind every {lim['remind_minutes']} min")
+        log("limits: " + ("; ".join(parts) if parts else "none"))
+        return True
+
+    def check(self, today):
+        day = today.isoformat()
+        self.daily.check(day, self.store.day_total(day))
+        if self.cycle.limit:
+            start = cycle_start(today, self.cfg["cycle_day"]).isoformat()
+            row = self.store.db.execute(
+                "SELECT COALESCE(SUM(rx + tx), 0) FROM iface_daily WHERE day >= ? AND day <= ?",
+                (start, day)).fetchone()
+            self.cycle.check(start, row[0])
 
 
 # --------------------------------------------------------------------------
@@ -771,12 +1018,8 @@ def main():
 
     log(f"counting interfaces: {', '.join(interfaces)}")
 
-    limit_bytes = int(cfg["daily_limit_gb"] * 1024 ** 3)
-    store.set_meta("daily_limit_bytes", limit_bytes)
-    if limit_bytes:
-        log(f"daily limit: {human(limit_bytes)} "
-            f"(notify at {', '.join(str(t) + '%' for t in cfg['notify_at'])})")
-    notifier = DailyLimitNotifier(store, limit_bytes, cfg["notify_at"])
+    limits = Limits(store, cfg)
+    store.commit()
 
     sampler = InterfaceSampler(store, interfaces)
     accumulator = AppAccumulator()
@@ -794,18 +1037,28 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
+    # Per-app rows from before this date include loopback, bridge and tunnel
+    # traffic; the dashboard says so. Written once, the first time the
+    # filtered probe is seen running, and never moved forward afterwards.
+    filter_since = store.get_meta("app_filter_since")
+
     while not stopping.is_set():
         if stopping.wait(cfg["interval"]):
             break
-        today = date.today().isoformat()
+        now = datetime.now()
+        today = now.date().isoformat()
         try:
-            sampler.sample(today)
+            sampler.sample(today, now.strftime("%Y-%m-%d %H"))
             for app, (rx, tx) in accumulator.drain().items():
                 store.add_app(today, app, rx, tx)
             store.set_meta("heartbeat", time.time())
-            store.set_meta("backend",
-                           backend.state if backend else "off")
-            notifier.check(today, store.day_total(today))
+            state = backend.state if backend else "off"
+            store.set_meta("backend", state)
+            if state == FILTERED_PROBE and not filter_since:
+                filter_since = today
+                store.set_meta("app_filter_since", today)
+            limits.reload()
+            limits.check(now.date())
             store.commit()
         except sqlite3.Error as exc:
             log(f"database error: {exc}")
@@ -818,9 +1071,10 @@ def main():
         if proc and proc.poll() is None:
             proc.terminate()
     # final flush so the last interval is not lost
-    today = date.today().isoformat()
+    now = datetime.now()
+    today = now.date().isoformat()
     try:
-        sampler.sample(today)
+        sampler.sample(today, now.strftime("%Y-%m-%d %H"))
         for app, (rx, tx) in accumulator.drain().items():
             store.add_app(today, app, rx, tx)
         store.commit()

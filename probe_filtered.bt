@@ -1,0 +1,147 @@
+#!/usr/bin/env bpftrace
+/*
+ * Per-process socket byte accounting, limited to traffic that actually leaves
+ * through one of the counted physical interfaces.
+ *
+ * The plain probes count every socket byte, including loopback, docker bridge
+ * and tailscale tunnel traffic that never touches a NIC; on busy days that
+ * made the per-app total ten times the interface total. Here each event looks
+ * at the route the socket has cached (sk_dst_cache) and keeps it only when the
+ * route's device is a counted interface. The collector replaces the ifindex
+ * test placeholder with those interfaces' indexes before starting bpftrace.
+ *
+ * When no route is cached (unconnected UDP, or a route just invalidated), the
+ * IPv4 addresses decide instead: 127.0.0.0/8, or a peer equal to the local
+ * address, is dropped; anything else is counted. skc_daddr is in network byte
+ * order, so its low byte is the first octet.
+ *
+ * Inside a container network namespace the ifindex numbers belong to that
+ * namespace and mean nothing here. There the container's own loopback and
+ * private (RFC 1918) peers are dropped, since those reach the host or other
+ * containers over the bridge, and everything else is counted as internet.
+ *
+ * Output is the default map print format, same as probe_print.bt:
+ *     @tx[<pid>, <comm>]: <bytes>
+ * See probe_for.bt for why the receive paths are cast to int32.
+ */
+
+kprobe:tcp_sendmsg
+{
+        $sk = (struct sock *)arg0;
+        $d = $sk->__sk_common.skc_daddr;
+        $v4 = $sk->__sk_common.skc_family == 2;
+        $dst = $sk->sk_dst_cache;
+        $keep = 1;
+        if ($dst != 0) {
+                $idx = $dst->dev->ifindex;
+                if ((uint64)curtask->nsproxy->net_ns == kaddr("init_net")) {
+                        $keep = 0;
+                        if (__IFINDEX_TEST__) { $keep = 1; }
+                } else {
+                        if ($idx == 1) { $keep = 0; }
+                        if ($v4 && (($d & 0xff) == 10 || (($d & 0xff) == 172 && (($d >> 8) & 0xf0) == 16) || ($d & 0xffff) == 0xa8c0)) { $keep = 0; }
+                }
+        } else {
+                if ($v4 && (($d & 0xff) == 127 || ($d != 0 && $d == $sk->__sk_common.skc_rcv_saddr))) { $keep = 0; }
+        }
+        if ($keep) { @tx[pid, comm] = sum(arg2); }
+}
+
+kprobe:udp_sendmsg
+{
+        $sk = (struct sock *)arg0;
+        $d = $sk->__sk_common.skc_daddr;
+        $v4 = $sk->__sk_common.skc_family == 2;
+        $dst = $sk->sk_dst_cache;
+        $keep = 1;
+        if ($dst != 0) {
+                $idx = $dst->dev->ifindex;
+                if ((uint64)curtask->nsproxy->net_ns == kaddr("init_net")) {
+                        $keep = 0;
+                        if (__IFINDEX_TEST__) { $keep = 1; }
+                } else {
+                        if ($idx == 1) { $keep = 0; }
+                        if ($v4 && (($d & 0xff) == 10 || (($d & 0xff) == 172 && (($d >> 8) & 0xf0) == 16) || ($d & 0xffff) == 0xa8c0)) { $keep = 0; }
+                }
+        } else {
+                if ($v4 && (($d & 0xff) == 127 || ($d != 0 && $d == $sk->__sk_common.skc_rcv_saddr))) { $keep = 0; }
+                /* unconnected sendto(): the destination is in the message */
+                $msg = (struct msghdr *)arg1;
+                if ($msg->msg_name != 0) {
+                        $sin = (struct sockaddr_in *)$msg->msg_name;
+                        if ($sin->sin_family == 2 && ($sin->sin_addr.s_addr & 0xff) == 127) { $keep = 0; }
+                }
+        }
+        if ($keep) { @tx[pid, comm] = sum(arg2); }
+}
+
+kprobe:tcp_cleanup_rbuf /(int32)arg1 > 0/
+{
+        $sk = (struct sock *)arg0;
+        $d = $sk->__sk_common.skc_daddr;
+        $v4 = $sk->__sk_common.skc_family == 2;
+        $dst = $sk->sk_dst_cache;
+        $keep = 1;
+        if ($dst != 0) {
+                $idx = $dst->dev->ifindex;
+                if ((uint64)curtask->nsproxy->net_ns == kaddr("init_net")) {
+                        $keep = 0;
+                        if (__IFINDEX_TEST__) { $keep = 1; }
+                } else {
+                        if ($idx == 1) { $keep = 0; }
+                        if ($v4 && (($d & 0xff) == 10 || (($d & 0xff) == 172 && (($d >> 8) & 0xf0) == 16) || ($d & 0xffff) == 0xa8c0)) { $keep = 0; }
+                }
+        } else {
+                if ($v4 && (($d & 0xff) == 127 || ($d != 0 && $d == $sk->__sk_common.skc_rcv_saddr))) { $keep = 0; }
+        }
+        if ($keep) { @rx[pid, comm] = sum((int32)arg1); }
+}
+
+/* The socket is only an argument on entry; keep it per thread for the return. */
+kprobe:udp_recvmsg
+{
+        @usk[tid] = arg0;
+        @umsg[tid] = arg1;
+}
+
+kretprobe:udp_recvmsg
+{
+        $sk = (struct sock *)@usk[tid];
+        $msg = (struct msghdr *)@umsg[tid];
+        delete(@usk[tid]);
+        delete(@umsg[tid]);
+        $n = (int32)retval;
+        if ($n > 0 && $sk != 0) {
+                $d = $sk->__sk_common.skc_daddr;
+                $v4 = $sk->__sk_common.skc_family == 2;
+                $dst = $sk->sk_dst_cache;
+                $keep = 1;
+                if ($dst != 0) {
+                        $idx = $dst->dev->ifindex;
+                        if ((uint64)curtask->nsproxy->net_ns == kaddr("init_net")) {
+                                $keep = 0;
+                                if (__IFINDEX_TEST__) { $keep = 1; }
+                        } else {
+                                if ($idx == 1) { $keep = 0; }
+                                if ($v4 && (($d & 0xff) == 10 || (($d & 0xff) == 172 && (($d >> 8) & 0xf0) == 16) || ($d & 0xffff) == 0xa8c0)) { $keep = 0; }
+                        }
+                } else {
+                        if ($v4 && (($d & 0xff) == 127 || ($d != 0 && $d == $sk->__sk_common.skc_rcv_saddr))) { $keep = 0; }
+                        /* unconnected socket: the sender was written into the message */
+                        if ($msg != 0 && $msg->msg_name != 0) {
+                                $sin = (struct sockaddr_in *)$msg->msg_name;
+                                if ($sin->sin_family == 2 && ($sin->sin_addr.s_addr & 0xff) == 127) { $keep = 0; }
+                        }
+                }
+                if ($keep) { @rx[pid, comm] = sum($n); }
+        }
+}
+
+interval:s:__INTERVAL__ {
+        print(@tx);
+        print(@rx);
+        clear(@tx);
+        clear(@rx);
+}
+
+END { clear(@tx); clear(@rx); clear(@usk); clear(@umsg); }

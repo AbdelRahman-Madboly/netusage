@@ -9,7 +9,12 @@ Runs as a systemd service. Two independent jobs:
      independent of which network you are attached to, and survives reboots
      because the last raw counter value is checkpointed to the database.
 
-  2. Per-process accounting - attributes bytes to a process name using eBPF
+  2. Per-network accounting - the same interface deltas, filed under the
+     network they went over: a Wi-Fi router, keyed by its BSSID so renaming
+     the network or changing its password keeps the same entry, or a wired
+     network, keyed by its gateway's MAC address.
+
+  3. Per-process accounting - attributes bytes to a process name using eBPF
      kprobes on the socket send/receive paths (falls back to nethogs, then to
      disabled). Only sockets routed through the counted NICs are kept, so
      loopback, docker bridge and tunnel traffic stay out. These are payload
@@ -42,7 +47,13 @@ DEFAULTS = {
     "backend": "auto",
     "daily_limit_gb": "0",
     "notify_at": "80,100,150,200",
+    "share": "on",
+    "share_port": "8765",
 }
+# Secret the phone app must present to read usage over the home network.
+SHARE_TOKEN_PATH = os.environ.get("NETUSAGE_SHARE_TOKEN", "/var/lib/netusage/share.token")
+# Family phones: {"members": {id: {"name": ..., "token": ...}}}. Owned by the desktop user.
+DEVICES_PATH = os.environ.get("NETUSAGE_DEVICES", "/var/lib/netusage/devices.json")
 
 
 def log(msg):
@@ -63,6 +74,8 @@ def load_config():
                 if parser.has_option("general", key):
                     cfg[key] = parser.get("general", key).strip()
     cfg["cycle_day"] = max(1, min(28, int(cfg["cycle_day"])))
+    cfg["share"] = str(cfg["share"]).lower() in ("on", "yes", "true", "1")
+    cfg["share_port"] = int(cfg["share_port"])
     cfg["interval"] = max(2, int(cfg["interval"]))
     cfg["daily_limit_gb"] = max(0.0, float(cfg["daily_limit_gb"]))
     cfg["notify_at"] = sorted({
@@ -170,6 +183,30 @@ CREATE TABLE IF NOT EXISTS app_daily (
     tx  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, app)
 );
+CREATE TABLE IF NOT EXISTS net_hourly (
+    hour TEXT    NOT NULL,
+    net  TEXT    NOT NULL,
+    rx   INTEGER NOT NULL DEFAULT 0,
+    tx   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour, net)
+);
+CREATE TABLE IF NOT EXISTS networks (
+    key        TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    label      TEXT NOT NULL,
+    names      TEXT NOT NULL DEFAULT '',
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS remote_usage (
+    device TEXT    NOT NULL,
+    hour   INTEGER NOT NULL,
+    net    TEXT    NOT NULL,
+    key    TEXT    NOT NULL,
+    rx     INTEGER NOT NULL DEFAULT 0,
+    tx     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (device, hour, net, key)
+);
 CREATE TABLE IF NOT EXISTS counter_state (
     iface   TEXT PRIMARY KEY,
     rx      INTEGER NOT NULL,
@@ -247,6 +284,32 @@ class Store:
             (day, app, rx, tx),
         )
 
+    def add_network(self, hour, key, rx, tx):
+        if rx == 0 and tx == 0:
+            return
+        self.db.execute(
+            "INSERT INTO net_hourly(hour, net, rx, tx) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(hour, net) DO UPDATE SET rx = rx + excluded.rx, "
+            "tx = tx + excluded.tx",
+            (hour, key, rx, tx),
+        )
+
+    def see_network(self, key, kind, name):
+        """Remember a network and every name it has gone by; label is the latest."""
+        now = time.time()
+        row = self.db.execute("SELECT names FROM networks WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            self.db.execute(
+                "INSERT INTO networks(key, kind, label, names, first_seen, last_seen) "
+                "VALUES(?, ?, ?, ?, ?, ?)", (key, kind, name, name, now, now))
+            return
+        names = [n for n in row[0].split("\n") if n]
+        if name and name not in names:
+            names.append(name)
+        self.db.execute(
+            "UPDATE networks SET label = COALESCE(NULLIF(?, ''), label), names = ?, "
+            "last_seen = ? WHERE key = ?", (name, "\n".join(names), now, key))
+
     def day_total(self, day):
         row = self.db.execute(
             "SELECT COALESCE(SUM(rx), 0) + COALESCE(SUM(tx), 0) "
@@ -277,6 +340,82 @@ def read_counter(iface):
         return None
 
 
+def _run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def router_key(bssid):
+    """Same key the phone app uses: the BSSID without its first and last octets,
+    which are the parts that differ between one router's 2.4 GHz and 5 GHz radios."""
+    parts = bssid.lower().split(":")
+    return "ap:" + ":".join(parts[1:-1]) if len(parts) == 6 else ""
+
+
+def _gateway(iface):
+    for line in _run("ip", "-4", "route", "show", "default", "dev", iface).splitlines():
+        m = re.search(r"via (\S+)", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _neighbour_mac(ip, iface):
+    m = re.search(r"lladdr (\S+)", _run("ip", "neigh", "show", ip, "dev", iface))
+    return m.group(1).lower() if m else None
+
+
+def identify_network(iface):
+    """(key, kind, name) of the network behind iface, or None when not connected.
+
+    Wi-Fi is keyed by router (BSSID), so a new SSID or password on the same
+    router stays one network. Wired is keyed by the gateway's MAC address."""
+    if os.path.isdir(f"/sys/class/net/{iface}/wireless"):
+        out = _run("nmcli", "-t", "-f", "IN-USE,BSSID,SSID", "dev", "wifi", "list",
+                   "ifname", iface, "--rescan", "no")
+        for line in out.splitlines():
+            if not line.startswith("*"):
+                continue
+            # nmcli -t escapes the colons inside the BSSID as "\:"
+            fields = re.split(r"(?<!\\):", line)
+            if len(fields) >= 3:
+                bssid = fields[1].replace("\\:", ":")
+                ssid = ":".join(fields[2:]).replace("\\:", ":")
+                key = router_key(bssid)
+                if key:
+                    return key, "wifi", ssid
+        return None
+    gw = _gateway(iface)
+    if not gw:
+        return None
+    mac = _neighbour_mac(gw, iface)
+    conn = _run("nmcli", "-g", "GENERAL.CONNECTION", "device", "show", iface).strip()
+    return ("gw:" + mac if mac else f"if:{iface}:{gw}"), "wired", conn or f"Ethernet via {gw}"
+
+
+class NetworkWatcher:
+    """Caches identify_network per interface; nmcli is cheap but not free."""
+
+    TTL = 30
+
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, iface):
+        hit = self.cache.get(iface)
+        now = time.monotonic()
+        if hit and now - hit[0] < self.TTL and hit[1] is not None:
+            return hit[1]
+        net = identify_network(iface)
+        self.cache[iface] = (now, net)
+        return net
+
+    def invalidate(self):
+        self.cache.clear()
+
+
 class InterfaceSampler:
     """Turns monotonic kernel counters into per-day deltas across reboots."""
 
@@ -284,6 +423,7 @@ class InterfaceSampler:
         self.store = store
         self.interfaces = interfaces
         self.last = store.load_counters()
+        self.networks = NetworkWatcher()
 
     def sample(self, day, hour=None):
         # The hour key must name the same day as `day`, so it is built from it
@@ -310,6 +450,12 @@ class InterfaceSampler:
             self.store.add_iface(day, iface, d_rx, d_tx)
             self.store.add_iface_hourly(hour, iface, d_rx, d_tx)
             self.store.save_counter(iface, rx, tx)
+            if d_rx or d_tx:
+                net = self.networks.get(iface)
+                if net:
+                    key, kind, name = net
+                    self.store.add_network(hour, key, d_rx, d_tx)
+                    self.store.see_network(key, kind, name)
 
 
 # --------------------------------------------------------------------------
@@ -1000,6 +1146,271 @@ class Limits:
 
 
 # --------------------------------------------------------------------------
+# sharing with the phone app
+# --------------------------------------------------------------------------
+
+def usage_export(db_path, since):
+    """This laptop's usage since an epoch second, per network, for the phone app.
+
+    Rows are [hour_epoch, net, key, rx, tx]; see netusage_data.laptop_rows for
+    how untracked Wi-Fi is placed."""
+    sys.path.insert(0, HERE)
+    import netusage_data as nd
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    try:
+        networks = [{"key": k, "kind": kind, "label": lab,
+                     "names": [n for n in names.split("\n") if n]}
+                    for k, kind, lab, names in db.execute(
+                        "SELECT key, kind, label, names FROM networks")]
+        return {"version": 2, "device": os.uname().nodename, "now": int(time.time()),
+                "networks": networks, "hours": nd.laptop_rows(db, since)}
+    finally:
+        db.close()
+
+
+SHARE_WINDOW = 300   # seconds a signed request stays valid
+
+
+def share_signature(token, *parts):
+    """HMAC-SHA256 of the parts, one per line. The token itself never crosses the network."""
+    import hashlib
+    import hmac
+    msg = "\n".join(str(p) for p in parts).encode()
+    return hmac.new(token.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def start_share_server(cfg):
+    """Read-only HTTP endpoint for the phone app on the home network.
+
+    GET /v1/usage?since=<epoch>&ts=<epoch>&nonce=<random>&sig=<hmac> where sig
+    signs path, since, ts and nonce with the token in SHARE_TOKEN_PATH. The
+    token is never sent, so a device that answers the phone while it searches
+    the network learns nothing it can reuse; a nonce is accepted once and only
+    within SHARE_WINDOW. The reply carries X-Netusage-Sig, the HMAC of the
+    nonce and body, so the phone can tell the real laptop from an impostor.
+    Only private-network clients are answered."""
+    import hmac
+    import ipaddress
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    try:
+        with open(SHARE_TOKEN_PATH) as f:
+            token = f.read().strip()
+    except OSError:
+        token = ""
+    if len(token) < 16:
+        log(f"sharing off: no token in {SHARE_TOKEN_PATH}")
+        return None
+    seen = {}            # nonce -> expiry
+    seen_lock = threading.Lock()
+
+    def fresh(nonce, ts):
+        now = time.time()
+        if abs(now - ts) > SHARE_WINDOW or not 16 <= len(nonce) <= 64:
+            return False
+        with seen_lock:
+            for n in [n for n, exp in seen.items() if exp < now]:
+                del seen[n]
+            if nonce in seen:
+                return False
+            seen[nonce] = now + 2 * SHARE_WINDOW
+        return True
+
+    def members():
+        """Family phones from DEVICES_PATH: {id: (name, token)}. Re-read on every
+        request so a phone can be added without restarting anything."""
+        try:
+            with open(DEVICES_PATH) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        out = {}
+        for mid, m in (data.get("members") or {}).items():
+            tok = str(m.get("token", ""))
+            if len(tok) >= 16:
+                out[str(mid)] = (str(m.get("name") or mid)[:32], tok)
+        return out
+
+    def set_meta(db, key, value):
+        db.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) "
+                   "DO UPDATE SET value = excluded.value", (key, str(value)))
+
+    def store_report(body, device, master):
+        """A phone's own usage per network. Only the master phone's report also
+        carries the plan (size, extra bundle, ISP reading), which every family
+        phone then reads back through /v1/plan."""
+        rows = body.get("hours") or []
+        db = sqlite3.connect(cfg["db"], timeout=15)
+        try:
+            if rows:
+                db.execute("DELETE FROM remote_usage WHERE device = ? AND hour >= ?",
+                           (device, min(int(r[0]) for r in rows)))
+                db.executemany(
+                    "INSERT OR REPLACE INTO remote_usage(device, hour, net, key, rx, tx) "
+                    "VALUES(?, ?, ?, ?, ?, ?)",
+                    [(device, int(h), str(n), str(k), int(rx), int(tx)) for h, n, k, rx, tx in rows])
+            if master:
+                plan = body.get("plan") or {}
+                for key in ("plan_gb", "extra_gb", "extra_cycle", "isp_used_gb", "isp_at",
+                            "plan_key", "cycle_day"):
+                    if key in plan:
+                        set_meta(db, f"phone_{key}", plan[key])
+                set_meta(db, "phone_device", device)
+                set_meta(db, "phone_report_at", int(time.time()))
+            else:
+                set_meta(db, f"member_report_at:{device}", int(time.time()))
+            db.commit()
+        finally:
+            db.close()
+
+    def plan_summary():
+        """Only the bundle's totals, which is all a family phone is shown."""
+        sys.path.insert(0, HERE)
+        import netusage_data as nd
+        db = sqlite3.connect(f"file:{cfg['db']}?mode=ro", uri=True, timeout=10)
+        try:
+            h = nd.household(db, cfg["cycle_day"])
+            if h is None:
+                return {"plan": None}
+            return {"plan": {"total": h.plan, "used": h.used, "remaining": h.remaining,
+                             "cycle_start": h.cycle.start.isoformat(),
+                             "renews": h.cycle.end.isoformat(),
+                             "isp_at": h.reported_at, "plan_key": nd.meta(db, "phone_plan_key", ""),
+                             "updated": int(time.time())}}
+        finally:
+            db.close()
+
+    def member_rows(since):
+        db = sqlite3.connect(f"file:{cfg['db']}?mode=ro", uri=True, timeout=10)
+        try:
+            names = {name for name, _ in members().values()}
+            out = {}
+            for dev, h, n, k, rx, tx in db.execute(
+                    "SELECT device, hour, net, key, rx, tx FROM remote_usage WHERE hour >= ?", (since,)):
+                if dev in names:
+                    out.setdefault(dev, []).append([h, n, k, rx, tx])
+            return {"devices": [{"name": d, "hours": sorted(r)} for d, r in out.items()]}
+        finally:
+            db.close()
+
+    class Handler(BaseHTTPRequestHandler):
+        """Every request names who sends it (dev=<member id>, or none for the
+        master phone) and is signed with that phone's own token. Family phones
+        may only send their usage and read the plan's totals."""
+
+        def _auth(self, *signed):
+            try:
+                private = ipaddress.ip_address(self.client_address[0]).is_private
+            except ValueError:
+                private = False
+            if not private:
+                self._send(403, {"error": "forbidden"})
+                return None
+            q = self.q
+            dev = q.get("dev", "")
+            if dev:
+                m = members().get(dev)
+                if m is None:
+                    self._send(401, {"error": "unknown phone"})
+                    return None
+                name, tok = m
+            else:
+                name, tok = None, token
+            try:
+                ts = int(q.get("ts", "0"))
+            except ValueError:
+                self._send(400, {"error": "bad request"})
+                return None
+            nonce = q.get("nonce", "")
+            want = share_signature(tok, self.url.path, *signed, ts, nonce)
+            if not hmac.compare_digest(q.get("sig", ""), want):
+                self._send(401, {"error": "bad signature"})
+                return None
+            if not fresh(nonce, ts):
+                self._send(401, {"error": "stale or repeated request"})
+                return None
+            self.tok, self.nonce = tok, nonce
+            return name or "", dev == ""
+
+        def _parse(self):
+            self.url = urlparse(self.path)
+            self.q = {k: v[0] for k, v in parse_qs(self.url.query).items()}
+            self.tok = self.nonce = None
+
+        def do_POST(self):
+            """POST /v1/phone: signed like a GET, plus the SHA-256 of the body."""
+            import hashlib
+            self._parse()
+            if self.url.path != "/v1/phone":
+                return self._send(404, {"error": "not found"})
+            length = int(self.headers.get("Content-Length") or 0)
+            if not 0 < length <= 20 * 1024 * 1024:
+                return self._send(413, {"error": "too large"})
+            raw = self.rfile.read(length)
+            who = self._auth(hashlib.sha256(raw).hexdigest())
+            if who is None:
+                return
+            name, master = who
+            try:
+                body = json.loads(raw)
+                device = str(body.get("device") or "phone")[:64] if master else name
+                store_report(body, device, master)
+            except (ValueError, TypeError, KeyError, sqlite3.Error) as exc:
+                return self._send(400, {"error": str(exc)})
+            self._send(200, {"ok": True})
+
+        def do_GET(self):
+            self._parse()
+            try:
+                since = int(self.q.get("since", "0"))
+            except ValueError:
+                return self._send(400, {"error": "bad request"})
+            who = self._auth(since)
+            if who is None:
+                return
+            name, master = who
+            try:
+                if self.url.path == "/v1/ping":
+                    return self._send(200, {"device": os.uname().nodename, "name": name})
+                if self.url.path == "/v1/plan":
+                    return self._send(200, plan_summary())
+                if not master:
+                    return self._send(403, {"error": "not allowed for this phone"})
+                if self.url.path == "/v1/usage":
+                    return self._send(200, usage_export(cfg["db"], since))
+                if self.url.path == "/v1/phones":
+                    return self._send(200, member_rows(since))
+                self._send(404, {"error": "not found"})
+            except sqlite3.Error as exc:
+                self._send(500, {"error": str(exc)})
+
+        def _send(self, code, body):
+            data = json.dumps(body, separators=(",", ":")).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            if self.tok and self.nonce:
+                # signed with the asking phone's token, so it knows the reply is the laptop's
+                self.send_header("X-Netusage-Sig", share_signature(self.tok, self.nonce, data.decode()))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *_args):
+            pass
+
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", cfg["share_port"]), Handler)
+    except OSError as exc:
+        log(f"sharing off: port {cfg['share_port']}: {exc.strerror}")
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True, name="share").start()
+    log(f"sharing usage with the phone app on port {cfg['share_port']}")
+    return server
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -1025,6 +1436,7 @@ def main():
     accumulator = AppAccumulator()
     names = NameCache()
     backend = start_backend(cfg, accumulator, names, interfaces)
+    share = start_share_server(cfg) if cfg["share"] else None
 
     # A stop flag, not a run flag: Event.wait() returns immediately when the
     # event is already set, so waiting on a "still running" event would never
@@ -1065,6 +1477,8 @@ def main():
             time.sleep(2)
 
     log("shutting down")
+    if share:
+        share.shutdown()
     if backend:
         backend.stop.set()
         proc = getattr(backend, "proc", None)

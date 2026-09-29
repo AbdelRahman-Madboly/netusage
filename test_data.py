@@ -5,7 +5,7 @@ import os
 import sqlite3
 import sys
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import collector
@@ -190,6 +190,112 @@ def test_labels():
           "25 Sep – 24 Oct 2026")
 
 
+def test_networks():
+    print("\n== networks ==")
+    check("router key drops the octets that differ between bands",
+          collector.router_key("A0:11:22:33:44:5D"), "ap:11:22:33:44")
+    check("2.4 and 5 GHz radios share a key",
+          collector.router_key("A2:11:22:33:44:59"), collector.router_key("A0:11:22:33:44:5D"))
+    check("bad BSSID gives no key", collector.router_key("nonsense"), "")
+
+    wireless = nd._is_wireless
+    nd._is_wireless = lambda iface: iface == "wlan0"   # no real wlan0 needed
+    path = tempfile.mktemp(suffix=".db")
+    store = collector.Store(path)
+    d = date(2026, 9, 28)
+    store.add_iface(d.isoformat(), "wlan0", 10 * GB, GB)
+    store.add_network(f"{d} 10", "ap:aa", 4 * GB, 0)
+    store.add_network(f"{d} 11", "ap:bb", 3 * GB, GB)
+    # the collector writes the interface's hourly rows alongside the network's
+    store.add_iface_hourly(f"{d} 10", "wlan0", 4 * GB, 0)
+    store.add_iface_hourly(f"{d} 11", "wlan0", 3 * GB, GB)
+    store.see_network("ap:aa", "wifi", "Home")
+    store.see_network("ap:aa", "wifi", "Home-New")   # same router, renamed
+    store.see_network("ap:bb", "wifi", "Cafe")
+    store.commit()
+    db = nd.connect(path)
+    p = nd.period_for("day", d, 25)
+    empty = {"labels": {}, "merge": {}}
+    rows = {n.key: n for n in nd.networks(db, p, empty)}
+    check("label follows the latest name", rows["ap:aa"].label, "Home-New")
+    check("every name is kept", rows["ap:aa"].names, ["Home", "Home-New"])
+    check("untracked fills the gap to the interface total",
+          rows[nd.UNTRACKED].total, 11 * GB - 8 * GB)
+    merged = {"labels": {"ap:bb": "Both"}, "merge": {"ap:aa": "ap:bb"}}
+    rows = {n.key: n for n in nd.networks(db, p, merged)}
+    check("merge adds the groups", rows["ap:bb"].total, 8 * GB)
+    check("merged group takes the custom label", rows["ap:bb"].label, "Both")
+    check("merged key is gone", "ap:aa" in rows, False)
+    check("daily per group", nd.network_daily(db, "ap:bb", p, merged), {d: (7 * GB, GB)})
+    # Wi-Fi the laptop could not place goes where the phone was that day
+    store.db.execute("INSERT INTO remote_usage VALUES('phone', ?, 'wifi', 'ap:bb', ?, 0)",
+                     (int(datetime(d.year, d.month, d.day, 9).timestamp()), GB))
+    store.commit()
+    rows = {n.key: n for n in nd.networks(nd.connect(path), p, empty)}
+    check("untracked Wi-Fi follows the phone's network", rows["ap:bb"].total, 4 * GB + 3 * GB)
+    check("nothing left untracked", nd.UNTRACKED in rows, False)
+    check("merge chains resolve", nd.network_group("x", {"merge": {"x": "y", "y": "z"}}), "z")
+    check("merge loops stop", nd.network_group("x", {"merge": {"x": "y", "y": "x"}}) in ("x", "y"), True)
+    nd._is_wireless = wireless
+    os.unlink(path)
+
+
+def test_household():
+    print("\n== household plan ==")
+    import time as _t
+    path = tempfile.mktemp(suffix=".db")
+    store = collector.Store(path)
+    cycle = nd.period_for("cycle", date.today(), 27)
+    start = int(_t.mktime(cycle.start.timetuple()))
+    hour = lambda ts: datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H")
+    store.add_network(hour(start + 3600), "ap:home", 2 * GB, 0)       # laptop on the plan's router
+    store.add_network(hour(start + 7200), "ap:cafe", 5 * GB, 0)       # elsewhere: not the plan
+    store.db.executemany("INSERT INTO remote_usage VALUES(?, ?, ?, ?, ?, ?)", [
+        ("phone", start + 3600, "wifi", "ap:home", 3 * GB, 0),
+        ("phone", start + 3600, "mobile", "sim:x", 9 * GB, 0),         # mobile: not the plan
+    ])
+    for k, v in (("phone_plan_gb", 250), ("phone_plan_key", "ap:home"), ("phone_cycle_day", 27),
+                 ("phone_isp_used_gb", 40), ("phone_isp_at", start + 4 * 3600)):
+        store.set_meta(k, v)
+    store.commit()
+    db = nd.connect(path)
+    h = nd.household(db, 25, {"labels": {}, "merge": {}})
+    parts = dict(h.parts)
+    check("laptop counts only the plan's router", parts["Laptop"], 2 * GB)
+    check("phone counts only the plan's router", parts["Phone"], 3 * GB)
+    check("family is what the ISP counted beyond both", parts["Family"], 35 * GB)
+    check("used adds up to the ISP figure", h.used, 40 * GB)
+    # a day the old collector only kept as a daily total still counts for the laptop
+    store2 = collector.Store(path)
+    store2.add_iface(cycle.start.isoformat(), "wlan0", 6 * GB, 0)
+    store2.commit()
+    wireless = nd._is_wireless
+    nd._is_wireless = lambda iface: iface == "wlan0"
+    h2 = nd.household(nd.connect(path), 25, {"labels": {}, "merge": {}})
+    nd._is_wireless = wireless
+    check("daily-only Wi-Fi counts toward the laptop", dict(h2.parts)["Laptop"], 2 * GB + 6 * GB)
+    check("and comes out of the family share", dict(h2.parts)["Family"], 40 * GB - 11 * GB)
+    # a window ending mid-day still subtracts that day's later hourly rows
+    at = start + 2 * 3600
+    whole = nd._laptop_on_plan(nd.connect(path), "ap:home", {"labels": {}, "merge": {}}, start, start + 86400)
+    before = nd._laptop_on_plan(nd.connect(path), "ap:home", {"labels": {}, "merge": {}}, start, at)
+    after = nd._laptop_on_plan(nd.connect(path), "ap:home", {"labels": {}, "merge": {}}, at, start + 86400)
+    check("before + after the ISP reading = the whole day", before + after, whole)
+    # a reading in the middle of an hour: that hour counts as before, never in neither
+    mid = start + 3600 + 1200
+    b2 = nd._laptop_on_plan(nd.connect(path), "ap:home", {"labels": {}, "merge": {}}, start, mid)
+    a2 = nd._laptop_on_plan(nd.connect(path), "ap:home", {"labels": {}, "merge": {}}, mid, start + 86400)
+    check("an hour cut by the reading is not lost", b2 + a2, whole)
+    check("no plan until the phone reports", nd.household(nd.connect(_empty_db()), 25), None)
+    os.unlink(path)
+
+
+def _empty_db():
+    path = tempfile.mktemp(suffix=".db")
+    collector.Store(path).commit()
+    return path
+
+
 if __name__ == "__main__":
     test_periods()
     test_queries()
@@ -197,6 +303,8 @@ if __name__ == "__main__":
     test_limits_file()
     test_live_meter()
     test_labels()
+    test_networks()
+    test_household()
     print("\n" + ("ALL TESTS PASSED" if not FAILS
                   else f"{len(FAILS)} FAILURE(S): {FAILS}"))
     sys.exit(1 if FAILS else 0)

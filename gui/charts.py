@@ -877,3 +877,34 @@ class ShareBar(_Canvas):
             cr.set_source_rgb(*self.color)
             _rounded_rect(cr, 0, 0, max(w * self.fraction, h), h, h / 2)
             cr.fill()
+
+
+class StackedBar(_Canvas):
+    """One bar split into coloured parts against a total, e.g. a plan by device."""
+
+    def __init__(self, height=14):
+        super().__init__()
+        self.parts = []
+        self.total = 1
+        self.set_content_height(height)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+    def set_data(self, parts, total):
+        """parts: [(bytes, (r, g, b))]"""
+        self.parts = [(v, c) for v, c in parts if v > 0]
+        self.total = max(total, sum(v for v, _ in self.parts), 1)
+        self.queue_draw()
+
+    def _draw(self, _area, cr, w, h):
+        fg = _fg(self)
+        cr.set_source_rgba(*fg, 0.10)
+        _rounded_rect(cr, 0, 0, w, h, h / 2)
+        cr.fill()
+        x = 0.0
+        for v, color in self.parts:
+            pw = w * v / self.total
+            cr.set_source_rgb(*color)
+            cr.rectangle(x, 0, pw, h)
+            cr.fill()
+            x += pw

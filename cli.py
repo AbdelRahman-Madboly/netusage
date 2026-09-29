@@ -420,12 +420,34 @@ def cmd_live(db, cfg, args):
         print()
 
 
+def cmd_networks(db, cfg, args):
+    """This cycle per network: Wi-Fi by router, wired by gateway. Wi-Fi from
+    before per-network tracking is placed where the phone was."""
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import netusage_data as nd
+    today = date.today()
+    cycle_day = int(meta(db, "cycle_day", cfg["cycle_day"]))
+    start, end = cycle_bounds(today, cycle_day)
+    print()
+    print(f"  {BOLD('networks')}  {DIM(start.strftime('%d %b') + ' → ' + today.strftime('%d %b'))}")
+    print()
+    rows = nd.networks(db, nd.Period("cycle", start, end))
+    if not rows:
+        print(f"  {DIM('no data yet')}\n")
+        return
+    peak = max(n.total for n in rows) or 1
+    for n in rows[:args.limit]:
+        print(f"  {n.label[:24]:<24} {human(n.total):>10}  {bar(n.total / peak)}")
+    print()
+
+
 COMMANDS = {
     "report": cmd_report,
     "today": cmd_today,
     "apps": cmd_apps,
     "days": cmd_days,
     "cycles": cmd_cycles,
+    "networks": cmd_networks,
     "status": cmd_status,
     "live": cmd_live,
 }
@@ -438,6 +460,7 @@ HELP = """
   netusage apps       every application this cycle
   netusage days       per-day table for this cycle
   netusage cycles     previous billing cycles
+  netusage networks   this cycle per Wi-Fi router / wired network
   netusage status     collector health and backend in use
   netusage live       live throughput, Ctrl-C to stop
 

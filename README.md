@@ -27,6 +27,7 @@ netusage today     # today only, by application
 netusage apps      # every application this cycle
 netusage days      # per-day table for this cycle
 netusage cycles    # previous billing cycles
+netusage networks  # this cycle per Wi-Fi router / wired network
 netusage status    # collector health and which backend is active
 netusage live      # live throughput, Ctrl-C to stop
 ```
@@ -55,6 +56,13 @@ seconds.
 - **Apps.** Every application in the period, searchable and sortable, with a
   "new" badge on anything first seen in that period. Click one for its daily
   history, share and rank.
+- **Networks.** Usage per network in the period. Wi-Fi is tracked by router
+  (its BSSID), so renaming a network or changing its password keeps the same
+  entry, with every name it has had listed under it; the router's 2.4 GHz and
+  5 GHz radios count as one. Wired networks are tracked by the gateway's MAC
+  address. Click one for its daily chart, to give it your own name, or to
+  merge it with another network (a second router at the same place, say).
+  Traffic from before this was installed shows as "Before network tracking".
 - **History.** Billing cycles side by side, a year-long calendar of daily
   usage with over-limit days in red, the ten busiest days and totals by month.
 - **Status.** Collector health, backend, counted interfaces, data range and
@@ -85,7 +93,7 @@ for the rest of the day or cycle. The cycle start day still comes from
 
 Menu: export the current period as CSV (per-day and per-app bytes), copy a
 text summary. Keyboard: Alt+1..5 period, Alt+Left/Right step, Home current
-period, Ctrl+1..4 page, Ctrl+F search apps, Ctrl+R refresh, Ctrl+? all
+period, Ctrl+1..5 page, Ctrl+F search apps, Ctrl+R refresh, Ctrl+? all
 shortcuts.
 
 Editing files in this folder changes nothing until `./install-gui.sh` is run
@@ -131,6 +139,15 @@ network interfaces, read every 10 seconds and stored as per-day deltas.
   delta covering a gap (the first sample after a reboot or restart) lands in
   the hour it was read, as it does for the day.
 
+**The per-network breakdown** files the same interface deltas under the
+network they went over. Every 30 seconds the collector asks NetworkManager
+(`nmcli`) which access point a wireless interface is on, or looks up the MAC
+of a wired interface's default gateway. The key for a router is its BSSID
+without the first and last octets, which are the parts that differ between
+one router's radios; the phone app uses the same key, so a router shows up
+under the same identity on both. Names and merges set in the dashboard live
+in `/var/lib/netusage/networks.json`, owned by you like `limits.conf`.
+
 **The per-application breakdown** comes from eBPF kprobes on the socket
 send/receive paths (`tcp_sendmsg`, `tcp_cleanup_rbuf`, `udp_sendmsg`,
 `udp_recvmsg`), aggregated inside the kernel and dumped every 10 seconds.
@@ -161,6 +178,35 @@ the number to trust for consumption**; the per-app figures show the split.
 Sizes use 1024-based units, the same convention `vnstat` and most Linux tools
 use. If your provider quotes GB as 1,000,000,000 bytes, their figure will read
 about 7% higher than this one.
+
+## Phone app
+
+`android/` is the same tool for an Android phone (Kotlin, Jetpack Compose),
+with the same icon and pages: Overview, Networks, Apps, History, Settings.
+
+- Totals and per-app numbers come from Android's own network history
+  (`NetworkStatsManager`), copied into the app's database every 30 minutes
+  and whenever it is open, so they outlive the three months Android keeps.
+- A small always-on tracker notes which Wi-Fi router (by BSSID, as above) or
+  which SIM was connected, and each hour's exact total is shared out between
+  them. Needs Usage access, location "all the time" (Android hides the Wi-Fi
+  name and BSSID without it), phone and notifications.
+- Data plan and daily limit with warnings, per SIM, per router or overall.
+
+Build and install from this laptop with the phone plugged in:
+
+```sh
+cd android
+./gradlew assembleRelease
+# --user 0: only the main profile; without it Samsung also installs into Dual Apps
+adb install -r --user 0 app/build/outputs/apk/release/app-release.apk
+```
+
+`android/tools/build_import.py` builds a one-off `assets/import.json` with
+history from before the app existed: Android's hourly per-network history
+read over adb (`dumpsys netstats`), and daily and weekly per-app totals read
+from My Data Manager's screens. That file holds personal data and is kept out
+of git.
 
 ## Backends
 

@@ -1,0 +1,5 @@
+<resources>
+    <color name="window_bg">#F4F8FA</color>
+    <color name="tile_top">#1596B3</color>
+    <color name="tile_bottom">#0A4D63</color>
+</resources>

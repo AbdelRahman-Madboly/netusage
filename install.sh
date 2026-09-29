@@ -45,6 +45,7 @@ say "installing to $DEST"
 install -d -m 0755 "$DEST"
 install -m 0755 "$SRC/collector.py" "$DEST/collector.py"
 install -m 0755 "$SRC/cli.py"       "$DEST/cli.py"
+install -m 0644 "$SRC/netusage_data.py" "$DEST/netusage_data.py"
 for probe in "$SRC"/probe_*.bt; do
     install -m 0644 "$probe" "$DEST/$(basename "$probe")"
 done
@@ -81,6 +82,59 @@ if [ -n "$OWNER" ] && [ "$OWNER" != root ]; then
     chown "$OWNER" "$LIMITS"
 fi
 chmod 0644 "$LIMITS"
+
+# Network names and merges set from the dashboard's Networks page, same ownership.
+NETWORKS=/var/lib/netusage/networks.json
+if [ ! -f "$NETWORKS" ]; then
+    say "writing $NETWORKS"
+    printf '{\n  "labels": {},\n  "merge": {}\n}\n' > "$NETWORKS"
+fi
+if [ -n "$OWNER" ] && [ "$OWNER" != root ]; then
+    chown "$OWNER" "$NETWORKS"
+fi
+chmod 0644 "$NETWORKS"
+
+# Family phones allowed to report, each with its own token. Owned by the desktop
+# user so a phone can be added without sudo; the collector re-reads it per request.
+DEVICES=/var/lib/netusage/devices.json
+USER_DEVICES=""
+if [ -n "$OWNER" ] && [ "$OWNER" != root ]; then
+    USER_DEVICES="$(getent passwd "$OWNER" | cut -d: -f6)/.config/netusage/devices.json"
+fi
+# android/tools/add_family_phone.sh keeps the list in the user's config too
+if [ -n "$USER_DEVICES" ] && [ -s "$USER_DEVICES" ]; then
+    install -m 0600 "$USER_DEVICES" "$DEVICES"
+elif [ ! -f "$DEVICES" ]; then
+    say "writing $DEVICES"
+    printf '{\n  "members": {}\n}\n' > "$DEVICES"
+fi
+chmod 0600 "$DEVICES"
+[ -n "$OWNER" ] && [ "$OWNER" != root ] && chown "$OWNER" "$DEVICES"
+
+# Token the phone app uses to read usage over the home network. Kept in the
+# user's config so rebuilding the phone app can pick it up; the collector reads
+# its own copy here.
+TOKEN=/var/lib/netusage/share.token
+USER_TOKEN=""
+if [ -n "$OWNER" ] && [ "$OWNER" != root ]; then
+    USER_TOKEN="$(getent passwd "$OWNER" | cut -d: -f6)/.config/netusage/share.token"
+fi
+if [ -n "$USER_TOKEN" ] && [ -s "$USER_TOKEN" ]; then
+    install -m 0600 "$USER_TOKEN" "$TOKEN"
+elif [ ! -s "$TOKEN" ]; then
+    say "creating $TOKEN"
+    head -c 24 /dev/urandom | base64 | tr -d '/+=' > "$TOKEN"
+    chmod 0600 "$TOKEN"
+fi
+[ -n "$OWNER" ] && [ "$OWNER" != root ] && chown "$OWNER" "$TOKEN"
+
+# Let phones on the local network reach the share port, and nothing else.
+if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    for net in 192.168.0.0/16 10.0.0.0/8 172.16.0.0/12; do
+        ufw allow from "$net" to any port 8765 proto tcp comment "netusage phone app" >/dev/null
+    done
+    say "firewall: port 8765 open to the local network only"
+fi
 
 if [ -f "$CONF" ]; then
     say "keeping existing $CONF"

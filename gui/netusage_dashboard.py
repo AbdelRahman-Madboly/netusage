@@ -10,7 +10,7 @@ import os
 import sqlite3
 import sys
 import traceback
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 for path in (HERE, os.path.dirname(HERE)):
@@ -25,7 +25,13 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 import netusage_data as nd  # noqa: E402
 from charts import (DOWN, UP, BarChart, CumulativeChart, Donut, Heatmap,  # noqa: E402
-                    Ring, ShareBar, Sparkline, app_color, rgb_hex, OTHER)
+                    Ring, ShareBar, Sparkline, StackedBar, app_color, rgb_hex, OTHER)
+
+# Same colours as the phone app: laptop mint, phone teal, family purple.
+HH_LAPTOP = (0.24, 0.84, 0.63)
+HH_PHONE = (0.08, 0.59, 0.70)
+HH_FAMILY = (0.49, 0.36, 0.84)
+HH_MEMBERS = [(0.36, 0.55, 0.96), (0.90, 0.42, 0.66), (0.95, 0.66, 0.23), (0.55, 0.75, 0.30)]
 
 APP_ID = "com.madboly.NetUsage"
 VERSION = "2.0"
@@ -213,6 +219,7 @@ class Window(Adw.ApplicationWindow):
 
         self._build_overview()
         self._build_apps()
+        self._build_networks()
         self._build_history()
         self._build_status()
         self.stack.connect("notify::visible-child-name", self._on_page)
@@ -303,7 +310,7 @@ class Window(Adw.ApplicationWindow):
         add("search", self._focus_search, ["<Control>f"])
         for i, kind in enumerate(nd.KINDS, 1):
             add(f"kind-{kind}", lambda k=kind: self.set_kind(k), [f"<Alt>{i}"])
-        for i, name in enumerate(("overview", "apps", "history", "status"), 1):
+        for i, name in enumerate(("overview", "apps", "networks", "history", "status"), 1):
             add(f"page-{name}", lambda n=name: self.stack.set_visible_child_name(n),
                 [f"<Control>{i}"])
         add("show-help-overlay", self._show_shortcuts, ["<Control>question"])
@@ -315,7 +322,8 @@ class Window(Adw.ApplicationWindow):
                          ("<Alt>Left", "Previous period"), ("<Alt>Right", "Next period"),
                          ("Home", "Current period")]),
             ("Pages", [("<Control>1", "Overview"), ("<Control>2", "Apps"),
-                       ("<Control>3", "History"), ("<Control>4", "Status"),
+                       ("<Control>3", "Networks"), ("<Control>4", "History"),
+                       ("<Control>5", "Status"),
                        ("<Control>f", "Search apps")]),
             ("General", [("<Control>r", "Refresh"), ("<Control>e", "Export CSV"),
                          ("<Control><Shift>c", "Copy summary"),
@@ -405,7 +413,9 @@ class Window(Adw.ApplicationWindow):
             self._on_page()
             self._refresh_period_bar()
             self._refresh_overview(db)
+            self._refresh_household(db)
             self._refresh_apps(db)
+            self._refresh_networks(db)
             self._refresh_history(db)
             self._refresh_status(db)
         except sqlite3.OperationalError as exc:
@@ -459,6 +469,8 @@ class Window(Adw.ApplicationWindow):
         titles.append(self.ov_subtitle)
         head.append(titles)
         box.append(head)
+
+        box.append(self._build_household())
 
         cards = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
                             min_children_per_line=1, max_children_per_line=4,
@@ -584,6 +596,94 @@ class Window(Adw.ApplicationWindow):
 
         self.stack.add_titled_with_icon(scrolled(box), "overview", "Overview",
                                         "utilities-system-monitor-symbolic")
+
+    def _build_household(self):
+        """The home plan split into this laptop, the phone and the family. Filled in
+        from what the phone app reports; hidden until it has."""
+        c = card("HOME PLAN")
+        top = Gtk.Box(spacing=12)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
+        self.hh_left = label("", ("hero", "numeric"))
+        self.hh_used = label("", ("dim-label",))
+        left.append(self.hh_left)
+        left.append(self.hh_used)
+        top.append(left)
+        self.hh_pill = pill("")
+        top.append(self.hh_pill)
+        c.append(top)
+        self.hh_bar = StackedBar()
+        c.append(self.hh_bar)
+        self.hh_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        c.append(self.hh_rows)
+        self.hh_note = label("", ("dim-label", "caption"), wrap=True)
+        c.append(self.hh_note)
+        self.hh_card = c
+        c.set_visible(False)
+        return c
+
+    def _refresh_household(self, db):
+        h = nd.household(db, self.cfg["cycle_day"])
+        self.hh_card.set_visible(h is not None)
+        if h is None:
+            return
+        colors = {"Laptop": HH_LAPTOP, "Phone": HH_PHONE, "Family": HH_FAMILY}
+        left = h.remaining
+        self.hh_left.set_label(f"{nd.human(left, 1)} left" if left >= 0 else f"{nd.human(-left, 1)} over")
+        today = date.today()
+        days_left = (h.cycle.end - today).days
+        elapsed = (today - h.cycle.start).days + 1
+        projected = h.used * (h.cycle.end - h.cycle.start).days / max(elapsed, 1)
+        self.hh_used.set_label(
+            f"{nd.human(h.used, 1)} used of {nd.human(h.plan, 0)} · {days_left} days left · "
+            f"{nd.human(max(left, 0) / max(days_left, 1), 1)} a day is safe · "
+            f"renews {h.cycle.end.strftime('%d %b')}")
+        if h.used > h.plan:
+            self.hh_pill.set_label("over plan")
+            self.hh_pill.set_css_classes(["pill", "bad"])
+        elif projected > h.plan:
+            self.hh_pill.set_label("fast pace")
+            self.hh_pill.set_css_classes(["pill", "warn"])
+        else:
+            self.hh_pill.set_label("on track")
+            self.hh_pill.set_css_classes(["pill", "good"])
+        member_colors = {n: HH_MEMBERS[i % len(HH_MEMBERS)] for i, (n, _) in enumerate(
+            p for p in h.parts if p[0] not in colors)}
+        self.hh_bar.set_data([(v, colors.get(n) or member_colors[n]) for n, v in h.parts], h.plan)
+        clear(self.hh_rows)
+        # My usage is this laptop and my phone together; then each family phone by
+        # name; whatever the ISP counted beyond all of them is everyone else.
+        parts = dict(h.parts)
+        phones = [(n, v) for n, v in h.parts if n not in ("Laptop", "Phone", "Family")]
+        mine = parts["Laptop"] + parts["Phone"]
+        self._hh_row("My usage", mine, h.used, None, bold=True)
+        self._hh_row("Laptop", parts["Laptop"], h.used, colors["Laptop"], indent=True)
+        self._hh_row("My phone", parts["Phone"], h.used, colors["Phone"], indent=True)
+        for i, (name, v) in enumerate(phones):
+            self._hh_row(name, v, h.used, HH_MEMBERS[i % len(HH_MEMBERS)], bold=True)
+        if h.reported_at is not None:
+            self._hh_row("Others" if phones else "Family", parts["Family"], h.used,
+                         colors["Family"], bold=True)
+        bits = []
+        if h.reported_at:
+            bits.append("From your ISP on " + datetime.fromtimestamp(h.reported_at).strftime("%d %b %H:%M")
+                        + "; family is what it counted beyond your laptop and phone.")
+        else:
+            bits.append("Enter the ISP's remaining quota in the phone app to include the family.")
+        if h.phone_report_at:
+            bits.append("Phone last reported " + datetime.fromtimestamp(h.phone_report_at).strftime("%d %b %H:%M") + ".")
+        self.hh_note.set_label(" ".join(bits))
+
+    def _hh_row(self, name, value, used, color, bold=False, indent=False):
+        row = Gtk.Box(spacing=8, margin_start=22 if indent else 0)
+        if color:
+            dot = Gtk.Label()
+            dot.set_markup(f"<span foreground='{rgb_hex(color)}'>●</span>")
+            row.append(dot)
+        row.append(label(name, ("heading",) if bold else ("dim-label",) if indent else (), hexpand=True))
+        row.append(label(nd.human(value, 1), ("app-total", "numeric")))
+        row.append(label(f"{value / max(used, 1) * 100:.0f}%", ("dim-label", "numeric"),
+                         width_chars=5, xalign=1.0))
+        self.hh_rows.append(row)
 
     def _sync_chart_mode(self):
         if self.chart_stack.get_visible_child_name() == "empty":
@@ -857,6 +957,67 @@ class Window(Adw.ApplicationWindow):
         extra = f"Showing the first {limit}. " if len(rows) > limit else ""
         self.apps_footer.set_label(extra + "“new” marks applications first seen in this "
                                    "period. Click any application for its history.")
+
+    # --------------------------------------------------------------- networks
+
+    def _build_networks(self):
+        box = page_box()
+        self.net_title = label("", ("title-2",), wrap=True)
+        box.append(self.net_title)
+        self.net_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.net_list.add_css_class("boxed-list")
+        self.net_list.connect("row-activated", self._on_network_row)
+        box.append(self.net_list)
+        box.append(label(
+            "Wi-Fi is tracked by router, so renaming a network or changing its password keeps "
+            "the same entry, with every name it has had listed under it. Wired networks are "
+            "tracked by their gateway. Click a network to see its days, rename it, or merge it "
+            "with another.", ("dim-label", "caption"), wrap=True))
+        self.stack.add_titled_with_icon(scrolled(box, 900), "networks", "Networks",
+                                        "network-wireless-symbolic")
+
+    def _refresh_networks(self, db):
+        p = self.period
+        rows = nd.networks(db, p)
+        total = sum(n.total for n in rows) or 1
+        peak = max((n.total for n in rows), default=1) or 1
+        tracked = [n for n in rows if n.kind != "untracked"]
+        self.net_title.set_label(f"{len(tracked)} networks · {p.label}")
+        clear(self.net_list)
+        for n in rows:
+            row = Adw.ActionRow(title=GLib.markup_escape_text(n.label),
+                                activatable=n.kind != "untracked")
+            row.network = n
+            icon = {"wifi": "network-wireless-symbolic", "wired": "network-wired-symbolic"}.get(
+                n.kind, "dialog-question-symbolic")
+            row.add_prefix(Gtk.Image(icon_name=icon))
+            bits = []
+            others = [x for x in n.names if x != n.label]
+            if others:
+                bits.append("also " + ", ".join(others))
+            if n.last_seen:
+                bits.append("last used " + datetime.fromtimestamp(n.last_seen).strftime("%d %b %H:%M"))
+            if n.kind == "untracked":
+                bits.append("traffic from before per-network tracking was installed")
+            bits.append(f"{n.total / total * 100:.1f}%")
+            row.set_subtitle(GLib.markup_escape_text(" · ".join(bits)))
+            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                            valign=Gtk.Align.CENTER)
+            right.append(label(nd.human(n.total), ("app-total", "numeric"), xalign=1.0))
+            bar = ShareBar(width=160)
+            bar.set_value(n.total / peak, OTHER if n.kind == "untracked" else DOWN)
+            right.append(bar)
+            row.add_suffix(right)
+            self.net_list.append(row)
+        if not rows:
+            self.net_list.append(Gtk.ListBoxRow(
+                child=label("No traffic in this period", ("dim-label",), xalign=0.5,
+                            margin_top=18, margin_bottom=18), activatable=False))
+
+    def _on_network_row(self, _box, row):
+        n = getattr(row, "network", None)
+        if n and n.kind != "untracked" and self.db:
+            NetworkDetail(self, n).present(self)
 
     # ---------------------------------------------------------------- history
 
@@ -1212,6 +1373,135 @@ class AppDetail(Adw.Dialog):
 
         tv.set_content(scrolled(box, 720))
         self.set_child(tv)
+
+
+class NetworkDetail(Adw.Dialog):
+    """One network: its days, the names it has had, and rename / merge / separate."""
+
+    def __init__(self, win, net):
+        super().__init__(title=net.label, content_width=720, content_height=680)
+        self.win = win
+        self.net = net
+        db = win.db
+        p = win.period
+        span = p if p.kind in ("week", "month", "cycle", "all") else \
+            nd.Period("custom", p.start - timedelta(days=29), p.start + timedelta(days=1))
+
+        tv = Adw.ToolbarView()
+        tv.add_top_bar(Adw.HeaderBar())
+        box = page_box()
+        box.append(label(net.label, ("title-1",), wrap=True))
+        if net.names:
+            box.append(label("Names seen: " + ", ".join(net.names), ("dim-label",), wrap=True))
+
+        stats = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+                            min_children_per_line=2, max_children_per_line=3,
+                            column_spacing=10, row_spacing=10)
+        for name, value, css in (("total", nd.human(net.total), ()),
+                                 ("download", nd.human(net.rx), ("down",)),
+                                 ("upload", nd.human(net.tx), ("up",))):
+            c = card(None, spacing=2)
+            c.append(label(name.upper(), ("card-title",)))
+            c.append(label(value, ("stat-value", "numeric") + css))
+            stats.append(c)
+        box.append(stats)
+
+        c = card(None, spacing=6)
+        c.append(label(f"Daily · {span.label if span.kind != 'custom' else 'last 30 days'}",
+                       ("title-4",)))
+        c.append(legend())
+        chart = BarChart(height=220)
+        per_day = nd.network_daily(db, net.key, span)
+        buckets = []
+        if span.kind == "all":
+            months = {}
+            for d, (r, t) in per_day.items():
+                k = d.replace(day=1)
+                mr, mt = months.get(k, (0, 0))
+                months[k] = (mr + r, mt + t)
+            for m in sorted(months):
+                buckets.append(nd.Bucket(m.strftime("%b"), m.strftime("%B %Y"), *months[m]))
+        else:
+            d = span.start
+            while d < span.end:
+                r, t = per_day.get(d, (0, 0))
+                buckets.append(nd.Bucket(str(d.day), d.strftime("%A %d %B"), r, t,
+                                         current=(d == date.today())))
+                d += timedelta(days=1)
+        chart.set_data(buckets)
+        c.append(chart)
+        box.append(c)
+
+        grp = Adw.PreferencesGroup(title="Manage")
+        if not nd.network_prefs_writable():
+            grp.set_description("Names and merges are saved to " + nd.NETWORKS_PATH +
+                                ". Run sudo ./install.sh once to make it editable.")
+        self.name_row = Adw.EntryRow(title="Show as", text=net.label, show_apply_button=True)
+        self.name_row.connect("apply", self._rename)
+        grp.add(self.name_row)
+
+        all_nets = [n for n in nd.networks(db, nd.period_for("all", date.today(),
+                                                             win.cfg["cycle_day"], nd.first_day(db)))
+                    if n.kind == net.kind and n.key != net.key]
+        self.targets = all_nets
+        merge = Adw.ComboRow(title="Merge into",
+                             subtitle="Count this network together with another one")
+        merge.set_model(Gtk.StringList.new(["—"] + [n.label for n in all_nets]))
+        merge.connect("notify::selected", self._merge)
+        grp.add(merge)
+        if len(net.keys) > 1:
+            sep = Adw.ActionRow(title="Merged from " + ", ".join(net.names or net.keys))
+            btn = Gtk.Button(label="Separate", valign=Gtk.Align.CENTER)
+            btn.connect("clicked", self._separate)
+            sep.add_suffix(btn)
+            grp.add(sep)
+        box.append(grp)
+
+        tv.set_content(scrolled(box, 720))
+        self.set_child(tv)
+
+    def _save(self, change):
+        prefs = nd.read_network_prefs()
+        change(prefs)
+        try:
+            nd.write_network_prefs(prefs)
+        except OSError as exc:
+            self.win.toasts.add_toast(Adw.Toast(title=f"Could not save: {exc.strerror}"))
+            return False
+        self.win.refresh()
+        return True
+
+    def _rename(self, row):
+        text = row.get_text().strip()
+
+        def change(prefs):
+            if text:
+                prefs["labels"][self.net.key] = text
+            else:
+                prefs["labels"].pop(self.net.key, None)
+        if self._save(change):
+            self.set_title(text or self.net.label)
+
+    def _merge(self, row, _pspec):
+        i = row.get_selected()
+        if i <= 0:
+            return
+        target = self.targets[i - 1]
+
+        def change(prefs):
+            prefs["merge"][self.net.key] = nd.network_group(target.key, prefs)
+        if self._save(change):
+            self.close()
+
+    def _separate(self, _btn):
+        def change(prefs):
+            for k in self.net.keys:
+                prefs["merge"].pop(k, None)
+            for k, v in list(prefs["merge"].items()):
+                if v == self.net.key:
+                    prefs["merge"].pop(k)
+        if self._save(change):
+            self.close()
 
 
 # --------------------------------------------------------------------------

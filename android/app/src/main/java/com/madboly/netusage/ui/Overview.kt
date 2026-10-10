@@ -277,7 +277,7 @@ private fun PlanHero(p: PlanStatus, label: String, onUpdate: () -> Unit) {
         }
         if (p.reportedAt != null) {
             Spacer(Modifier.height(4.dp))
-            PlanLine(if (phones.isEmpty()) "Family" else "Others", others, p.used, FamilyColor, bold = true)
+            PlanLine("Others", others, p.used, FamilyColor, bold = true)
         }
         Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(18.dp)) {

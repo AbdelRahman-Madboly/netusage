@@ -661,7 +661,7 @@ class Window(Adw.ApplicationWindow):
         for i, (name, v) in enumerate(phones):
             self._hh_row(name, v, h.used, HH_MEMBERS[i % len(HH_MEMBERS)], bold=True)
         if h.reported_at is not None:
-            self._hh_row("Others" if phones else "Family", parts["Family"], h.used,
+            self._hh_row("Others", parts["Family"], h.used,
                          colors["Family"], bold=True)
         bits = []
         if h.reported_at:

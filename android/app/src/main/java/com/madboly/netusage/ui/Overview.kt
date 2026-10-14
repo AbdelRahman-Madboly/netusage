@@ -344,8 +344,10 @@ private fun IspDialog(state: AppState, plan: PlanStatus?, onDone: () -> Unit) {
     var extra by remember {
         mutableStateOf(if (prefs.extraCycle == cycleStart && prefs.extraGb > 0) prefs.extraGb.toString() else "")
     }
+    var added by remember { mutableStateOf("") }
     val left = remaining.toDoubleOrNull()
     val total = size.toDoubleOrNull()
+    val addedGb = added.toDoubleOrNull() ?: 0.0
     AlertDialog(
         onDismissRequest = onDone,
         title = { Text("Update from ISP") },
@@ -363,22 +365,29 @@ private fun IspDialog(state: AppState, plan: PlanStatus?, onDone: () -> Unit) {
                 Spacer(Modifier.height(6.dp))
                 OutlinedTextField(extra, { extra = it }, label = { Text("Extra bundle this cycle (GB)") },
                     singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(added, { added = it }, label = { Text("Add a new bundle (GB)") },
+                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal))
                 Text("Changes here reach the family's phones the next time they sync.",
                     Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodySmall)
-                val extraGb = extra.toDoubleOrNull() ?: 0.0
+                val extraGb = (extra.toDoubleOrNull() ?: 0.0) + addedGb
                 if (left != null && total != null) Text("Used so far: ${"%.1f".format(total + extraGb - left)} GB",
                     Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodySmall)
             }
         },
         confirmButton = {
-            val extraGb = extra.toDoubleOrNull() ?: 0.0
-            TextButton(enabled = left != null && total != null && left <= total + extraGb, onClick = {
+            val extraGb = (extra.toDoubleOrNull() ?: 0.0) + addedGb
+            // A new bundle alone is enough: the ISP reading stays and the plan simply grows.
+            val bundleOnly = left == null && addedGb > 0
+            TextButton(enabled = total != null && (bundleOnly || (left != null && left <= total + extraGb)), onClick = {
                 prefs.planGb = total!!
                 prefs.extraGb = extraGb
                 prefs.extraCycle = if (extraGb > 0) cycleStart else ""
-                // the ISP's remaining covers the package and any extra bundle together
-                prefs.ispUsedGb = total + extraGb - left!!
-                prefs.ispAt = System.currentTimeMillis() / 1000
+                if (left != null) {
+                    // the ISP's remaining covers the package and any extra bundle together
+                    prefs.ispUsedGb = total + extraGb - left
+                    prefs.ispAt = System.currentTimeMillis() / 1000
+                }
                 onDone()
             }) { Text("Save") }
         },

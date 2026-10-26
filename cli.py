@@ -445,6 +445,11 @@ def cmd_networks(db, cfg, args):
 def cmd_bill(db, cfg, args):
     """What the cycle's bundles cost and the laptop's share: the laptop's GB on the
     home plan at the price per GB bought. `bill add GB PRICE [--fee P]` records a bundle."""
+    if args.rest[:1] in (["add"], ["base"]):
+        # Bills writes the price file from the bundles recorded there; one written here would be lost.
+        print("\n  Record bundles in the Bills app (Add charge, Home internet, with its Bundle size).\n"
+              "  It keeps this tool's prices in step.\n")
+        return
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import netusage_data as nd
     cycle_day = int(meta(db, "phone_cycle_day", 0) or meta(db, "cycle_day", cfg["cycle_day"]))
@@ -532,8 +537,7 @@ HELP = """
   netusage status     collector health and backend in use
   netusage live       live throughput, Ctrl-C to stop
   netusage bill       the cycle's cost and the laptop's share (laptop GB × price per GB)
-  netusage bill add GB PRICE --fee 14   record an extra bundle bought this cycle
-  netusage bill base GB PRICE           the bundle every cycle comes with
+  (bundles and their prices are recorded in the Bills app)
   netusage bill -b 1 --notify           last cycle's laptop share as a notification
   netusage bill -b 1 --json             the same as data, for the Bills app
 

@@ -379,6 +379,16 @@ def test_apps_bounded_by_interfaces():
           collector.bound_apps({"x": (1000, 1000)}, 0, 0), {"x": (1000, 1000)})
 
 
+def test_bundles_are_recorded_in_bills():
+    print("\n== bundles go in the Bills app ==")
+    import argparse, io, contextlib
+    out = io.StringIO()
+    args = argparse.Namespace(rest=["add", "100", "190"], back=0, fee=14, json=False, notify=False)
+    with contextlib.redirect_stdout(out):
+        cli.cmd_bill(None, {}, args)
+    check("bill add points to Bills", "Bills" in out.getvalue(), True)
+
+
 if __name__ == "__main__":
     test_cycles()
     test_counters()
@@ -391,6 +401,7 @@ if __name__ == "__main__":
     test_loop_paces()
     test_formatting()
     test_apps_bounded_by_interfaces()
+    test_bundles_are_recorded_in_bills()
     print("\n" + ("ALL TESTS PASSED" if not FAILS
                   else f"{len(FAILS)} FAILURE(S): {FAILS}"))
     sys.exit(1 if FAILS else 0)

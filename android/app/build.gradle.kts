@@ -3,6 +3,9 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+fun git(vararg args: String): String =
+    providers.exec { commandLine("git", *args); isIgnoreExitValue = true }.standardOutput.asText.get().trim()
+
 android {
     namespace = "com.madboly.netusage"
     compileSdk = 35
@@ -11,8 +14,9 @@ android {
         applicationId = "com.madboly.netusage"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        // Numbered from the repository, so Settings > Status shows which build is on the phone.
+        versionCode = git("rev-list", "--count", "HEAD").toIntOrNull() ?: 1
+        versionName = "1.$versionCode (${git("rev-parse", "--short", "HEAD")})"
     }
 
     buildTypes {
@@ -34,6 +38,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     composeOptions {

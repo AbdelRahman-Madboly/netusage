@@ -363,6 +363,22 @@ def test_formatting():
     check("None is safe", cli.human(None), "0 B")
 
 
+def test_apps_bounded_by_interfaces():
+    print("\n== per-app bounded by what the network cards carried ==")
+    G = 1024 ** 3
+    batch = {"curl": (0, 50 * G), "chrome": (2 * G, G // 4)}
+    out = collector.bound_apps(batch, 3 * G, G // 2)
+    check("a bogus upload is cut to the interface figure",
+          out["curl"][1] <= collector.app_cap(G // 2), True)
+    check("downloads untouched when under the interface", out["chrome"][0], 2 * G)
+    check("apps together never pass the cap",
+          sum(tx for _, tx in out.values()) <= collector.app_cap(G // 2), True)
+    normal = {"pip": (G, 1024), "git": (G // 2, 2048)}
+    check("normal traffic passes unchanged", collector.bound_apps(normal, 2 * G, G // 8), normal)
+    check("an idle interval still lets a little through",
+          collector.bound_apps({"x": (1000, 1000)}, 0, 0), {"x": (1000, 1000)})
+
+
 if __name__ == "__main__":
     test_cycles()
     test_counters()
@@ -374,6 +390,7 @@ if __name__ == "__main__":
     test_limits()
     test_loop_paces()
     test_formatting()
+    test_apps_bounded_by_interfaces()
     print("\n" + ("ALL TESTS PASSED" if not FAILS
                   else f"{len(FAILS)} FAILURE(S): {FAILS}"))
     sys.exit(1 if FAILS else 0)

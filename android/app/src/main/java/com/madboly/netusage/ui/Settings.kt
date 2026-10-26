@@ -48,6 +48,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.madboly.netusage.BuildConfig
 import com.madboly.netusage.data.Alerts
 import com.madboly.netusage.data.Laptop
 import com.madboly.netusage.data.MOBILE
@@ -233,6 +234,7 @@ fun SettingsScreen(state: AppState, onSync: () -> Unit) {
             Text("Last sync: ${at(info.first)}")
             Text("Tracker last looked: ${at(info.second)}")
             Text("History starts: ${info.third}")
+            Text("App version: ${BuildConfig.VERSION_NAME}")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = onSync) { Text("Sync now") }
                 OutlinedButton(onClick = { Tracker.start(context); tick++ }) { Text("Restart tracker") }

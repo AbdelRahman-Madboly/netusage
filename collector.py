@@ -426,10 +426,12 @@ class InterfaceSampler:
         self.networks = NetworkWatcher()
 
     def sample(self, day, hour=None):
+        """Record one interval. Returns the (rx, tx) all counted interfaces carried in it."""
         # The hour key must name the same day as `day`, so it is built from it
         # when the caller does not supply one.
         if hour is None:
             hour = f"{day} {datetime.now():%H}"
+        total_rx = total_tx = 0
         for iface in self.interfaces:
             current = read_counter(iface)
             if current is None:
@@ -447,6 +449,8 @@ class InterfaceSampler:
             else:
                 d_rx, d_tx = rx - prev[0], tx - prev[1]
             self.last[iface] = (rx, tx)
+            total_rx += d_rx
+            total_tx += d_tx
             self.store.add_iface(day, iface, d_rx, d_tx)
             self.store.add_iface_hourly(hour, iface, d_rx, d_tx)
             self.store.save_counter(iface, rx, tx)
@@ -456,6 +460,7 @@ class InterfaceSampler:
                     key, kind, name = net
                     self.store.add_network(hour, key, d_rx, d_tx)
                     self.store.see_network(key, kind, name)
+        return total_rx, total_tx
 
 
 # --------------------------------------------------------------------------
@@ -654,6 +659,40 @@ class AppAccumulator:
 # No process can move this much in one batch; anything larger is a probe
 # reading a kernel value at the wrong width, not real traffic.
 SANE_BATCH_LIMIT = 64 * 1024 ** 3
+
+# Per-app figures are payload, so in any interval they sit below what the
+# network cards carried. The slack covers a probe dump landing on the other
+# side of an interval boundary; the floor keeps a quiet or first interval
+# (interface delta 0) from wiping real traffic.
+APP_SLACK = 1.5
+APP_FLOOR = 64 * 1024 ** 2
+
+
+def app_cap(iface_bytes):
+    return int(iface_bytes * APP_SLACK) + APP_FLOOR
+
+
+def _bound(values, cap):
+    values = [min(v, cap) for v in values]          # no one app above the interfaces
+    total = sum(values)
+    if total > cap:                                 # nor all of them together
+        values = [v * cap // total for v in values]
+    return values
+
+
+def bound_apps(batch, iface_rx, iface_tx):
+    """Clamp one interval's per-app (rx, tx) to what the interfaces carried.
+    A run of bad probe readings once credited one process with far more
+    upload than the cards carried that day; each reading was under
+    SANE_BATCH_LIMIT, so only a comparison with the interfaces catches it."""
+    apps = list(batch)
+    rx = _bound([batch[a][0] for a in apps], app_cap(iface_rx))
+    tx = _bound([batch[a][1] for a in apps], app_cap(iface_tx))
+    out = dict(zip(apps, zip(rx, tx)))
+    if out != batch:
+        log(f"per-app clamped to interfaces ({iface_rx} rx, {iface_tx} tx): "
+            + ", ".join(f"{a} {batch[a]}" for a in apps if out[a] != batch[a]))
+    return out
 
 FOR_LINE = re.compile(r"^([TR])\s+(\d+)\s+(\S+)\s+(\d+)\s*$")
 PRINT_LINE = re.compile(r"^@(tx|rx)\[(\d+),\s*(.*?)\]:\s*(\d+)\s*$")
@@ -1460,8 +1499,8 @@ def main():
         now = datetime.now()
         today = now.date().isoformat()
         try:
-            sampler.sample(today, now.strftime("%Y-%m-%d %H"))
-            for app, (rx, tx) in accumulator.drain().items():
+            iface_rx, iface_tx = sampler.sample(today, now.strftime("%Y-%m-%d %H"))
+            for app, (rx, tx) in bound_apps(accumulator.drain(), iface_rx, iface_tx).items():
                 store.add_app(today, app, rx, tx)
             store.set_meta("heartbeat", time.time())
             state = backend.state if backend else "off"
@@ -1488,8 +1527,8 @@ def main():
     now = datetime.now()
     today = now.date().isoformat()
     try:
-        sampler.sample(today, now.strftime("%Y-%m-%d %H"))
-        for app, (rx, tx) in accumulator.drain().items():
+        iface_rx, iface_tx = sampler.sample(today, now.strftime("%Y-%m-%d %H"))
+        for app, (rx, tx) in bound_apps(accumulator.drain(), iface_rx, iface_tx).items():
             store.add_app(today, app, rx, tx)
         store.commit()
     except sqlite3.Error:

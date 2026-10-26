@@ -460,6 +460,10 @@ def cmd_bill(db, cfg, args):
             print(f"\n  added {gb:g} GB for {rows[-1]['egp']:.2f} EGP to the cycle from {start}\n")
         return
     b = nd.bill(db, cycle_day, anchor)
+    if args.json:
+        import json
+        print(json.dumps(nd.bill_json(b)))
+        return
     if args.notify:
         span = f"{b.cycle.start:%d %b} – {b.cycle.end - timedelta(days=1):%d %b}"
         body = (f"Laptop share {b.share_egp:.2f} EGP for {span}: laptop {b.laptop / 1024 ** 3:.1f} GB "
@@ -531,6 +535,7 @@ HELP = """
   netusage bill add GB PRICE --fee 14   record an extra bundle bought this cycle
   netusage bill base GB PRICE           the bundle every cycle comes with
   netusage bill -b 1 --notify           last cycle's laptop share as a notification
+  netusage bill -b 1 --json             the same as data, for the Bills app
 
   options
     -b N              bill: N cycles back (default 0, this cycle)
@@ -547,6 +552,7 @@ def main():
     parser.add_argument("-b", "--back", type=int, default=0)
     parser.add_argument("--fee", type=float, default=0)
     parser.add_argument("--notify", action="store_true")
+    parser.add_argument("--json", action="store_true")
     parser.add_argument("-n", "--limit", type=int, default=12)
     parser.add_argument("-i", "--interval", type=int, default=3)
     parser.add_argument("-h", "--help", action="store_true")

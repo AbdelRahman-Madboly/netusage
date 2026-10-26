@@ -325,6 +325,12 @@ def test_bill():
                                               "Coding assistants": 30 * GB, "Browser": 12 * GB})
     check("a cycle with no bundles costs nothing", nd.bill(nd.connect(path), 25,
           date.today() - timedelta(days=62), {"labels": {}, "merge": {}}, bills).cost, 0)
+    j = nd.bill_json(b)
+    check("json carries the laptop bytes", j["laptop_bytes"], b.laptop)
+    check("json carries cost and GB bought", (j["cost_egp"], j["gb_bought"]), (640.0, 510))
+    check("json cycle is ISO with an exclusive end",
+          (j["cycle_start"], j["cycle_end"]), (b.cycle.start.isoformat(), b.cycle.end.isoformat()))
+    check("json parts by name", j["parts"].get("Laptop"), b.laptop)
     check("a later cycle with no extras still pays the base", nd.bill(nd.connect(path), 25,
           date.today() + timedelta(days=31), {"labels": {}, "merge": {}}, bills).cost, 200)
     os.unlink(path)

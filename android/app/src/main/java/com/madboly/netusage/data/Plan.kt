@@ -2,6 +2,7 @@ package com.madboly.netusage.data
 
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
+import kotlin.math.roundToLong
 
 /**
  * Where the data plan stands. The ISP's own figure is the truth, since it also sees
@@ -18,9 +19,16 @@ data class PlanStatus(
 ) {
     val remaining: Long get() = plan - used
     val daysLeft: Long get() = ChronoUnit.DAYS.between(LocalDate.now(), cycle.end) + 1
-    val elapsedDays: Long get() = ChronoUnit.DAYS.between(cycle.start, LocalDate.now()) + 1
     val perDayLeft: Long get() = if (remaining > 0) remaining / daysLeft.coerceAtLeast(1) else 0
-    val projected: Long get() = used * cycle.days / elapsedDays.coerceAtLeast(1)
+    val projected: Long get() = projectedAt(System.currentTimeMillis() / 1000)
+
+    /** Usage at the end of the cycle at the pace so far. Counts the time actually gone, not
+     *  whole days: counting today as over made the last day's projection equal the usage. */
+    fun projectedAt(nowSec: Long): Long {
+        val length = cycle.endEpoch - cycle.startEpoch
+        val gone = (nowSec - cycle.startEpoch).coerceIn(86_400L, length)   // a day at least, early on
+        return (used.toDouble() * length / gone).roundToLong()
+    }
     val fraction: Float get() = if (plan > 0) used.toFloat() / plan else 0f
 }
 

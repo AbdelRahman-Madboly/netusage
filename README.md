@@ -1,4 +1,4 @@
-# netusage
+# Internet Usage (netusage)
 
 Tracks how much internet this laptop consumes over a billing cycle that runs
 from the 25th of one month to the 25th of the next, broken down by application.
@@ -53,7 +53,7 @@ Below the split, the laptop's GB are grouped by kind of application.
 ./install-gui.sh --remove    # take it off again
 ```
 
-Installs a **Net Usage** launcher on the desktop and in the applications menu.
+Installs an **Internet Usage** launcher on the desktop and in the applications menu.
 It is a GTK 4 / libadwaita app that reads the collector's database read-only,
 so it needs no root and cannot disturb collection. It refreshes every 10
 seconds.

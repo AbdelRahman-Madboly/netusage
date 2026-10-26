@@ -685,17 +685,17 @@ def _phone_on_plan(db, plan_key, prefs, start, end, device=None):
                if network_group(key, prefs) == plan_key)
 
 
-def household(db, cycle_day, prefs=None):
+def household(db, cycle_day, prefs=None, anchor=None):
     """The data plan as the phone app has it (size, network, ISP reading), split
     into this laptop, the phone and everything else the ISP counted: the family.
-    None until the phone has reported."""
+    `anchor` picks the cycle (default: the current one). None until the phone has reported."""
     prefs = prefs or read_network_prefs()
     plan_gb = float(meta(db, "phone_plan_gb", 0) or 0)
     plan_key = network_group(meta(db, "phone_plan_key", "") or "", prefs)
     if plan_gb <= 0 or not plan_key:
         return None
     cycle_day = int(meta(db, "phone_cycle_day", cycle_day) or cycle_day)
-    cycle = period_for("cycle", date.today(), cycle_day)
+    cycle = period_for("cycle", anchor or date.today(), cycle_day)
     start = time.mktime(cycle.start.timetuple())
     end = time.mktime(cycle.end.timetuple())
     master = meta(db, "phone_device", None)
@@ -720,6 +720,116 @@ def household(db, cycle_day, prefs=None):
     return Household(cycle, int((plan_gb + extra) * 1024 ** 3),
                      [("Laptop", laptop), ("Phone", phone)] + phones + [("Family", rest)],
                      reported, float(report_at) if report_at else None)
+
+
+# --------------------------------------------------------------------------
+# monthly bill: what the bundles cost and the laptop's share of it
+# --------------------------------------------------------------------------
+
+# Prices are mine, not the collector's, so they live in my home, not /var/lib.
+BILLS_PATH = os.environ.get("NETUSAGE_BILLS", os.path.expanduser("~/.config/netusage/bills.json"))
+
+# The laptop's applications grouped so the bill says what the GB were for.
+# First match wins; a name ending in "*" matches by prefix.
+APP_KINDS = [
+    ("Coding assistants", ["assistant-cli", "assistant", "assistant-desktop", "code-agent", "chat-client", "local-llm"]),
+    ("Packages and builds", ["pip", "uv", "npm", "pnpm", "yarn", "git", "docker", "gradle*",
+                             "java", "cargo", "go", "curl", "wget", "rclone", "trivy"]),
+    ("Dev servers and tests", ["postgres", "jest", "next-server*", "node", "ssh", "code",
+                               "vscode", "adb", "qemu*", "python", "python3"]),
+    ("Browser", ["chrome", "chrome-headless", "firefox"]),
+    ("System updates", ["apt", "snapd", "whoopsie", "fwupd*", "packagekitd", "update-manager"]),
+]
+OTHER_KIND = "Other"
+
+
+def app_kind(name):
+    for kind, names in APP_KINDS:
+        for n in names:
+            if name == n or (n.endswith("*") and name.startswith(n[:-1])):
+                return kind
+    return OTHER_KIND
+
+
+def read_bills(path=None):
+    """{"base": [{"gb", "egp"}], "cycles": {"<cycle start>": [{"gb", "egp"}, ...]}}: the
+    bundle every cycle comes with, then the extras bought in each cycle."""
+    import json
+    try:
+        with open(path or BILLS_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault("base", [])
+    data.setdefault("cycles", {})
+    return data
+
+
+def add_bundle(cycle_start, gb, price, fee_percent=0, path=None):
+    """Record an extra bundle bought for the cycle starting `cycle_start` (ISO date),
+    or with cycle_start None set the base bundle every cycle comes with. The fee (VAT
+    and the like) is added to the price, so "egp" is what was paid."""
+    import json
+    path = path or BILLS_PATH
+    data = read_bills(path)
+    row = {"gb": gb, "egp": round(price * (1 + fee_percent / 100), 2)}
+    if cycle_start is None:
+        data["base"] = rows = [row]
+    else:
+        rows = data["cycles"].setdefault(cycle_start, [])
+        rows.append(row)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return rows
+
+
+@dataclass
+class Bill:
+    cycle: "Period"
+    bundles: list           # [{"gb", "egp"}]
+    parts: list             # household split, [(name, bytes)]; [] before the phone reports
+    laptop: int             # laptop bytes on the plan's network
+    kinds: list             # [(kind, bytes, [(app, bytes)])], largest first, all networks
+
+    @property
+    def gb_bought(self):
+        return sum(b["gb"] for b in self.bundles)
+
+    @property
+    def cost(self):
+        return round(sum(b["egp"] for b in self.bundles), 2)
+
+    @property
+    def per_gb(self):
+        return self.cost / self.gb_bought if self.gb_bought else 0.0
+
+    @property
+    def share_egp(self):
+        return round(self.laptop / 1024 ** 3 * self.per_gb, 2)
+
+
+def bill(db, cycle_day, anchor=None, prefs=None, bills_path=None):
+    """The bill for the cycle containing `anchor`: what was paid, the price per GB
+    bought, and the laptop's share, its GB on the plan at that price. GB left
+    unused stay with me, so the shared side pays only for what it used."""
+    prefs = prefs or read_network_prefs()
+    h = household(db, cycle_day, prefs, anchor)
+    if h:
+        cycle, parts, laptop = h.cycle, h.parts, dict(h.parts)["Laptop"]
+    else:   # no phone reports: the laptop's whole cycle on every network
+        cycle = period_for("cycle", anchor or date.today(), cycle_day)
+        parts, laptop = [], sum(totals(db, cycle))
+    grouped = {}
+    for name, rx, tx in apps(db, cycle):
+        grouped.setdefault(app_kind(name), []).append((name, rx + tx))
+    kinds = sorted(((k, sum(v for _, v in rows), sorted(rows, key=lambda r: -r[1]))
+                    for k, rows in grouped.items()), key=lambda k: -k[1])
+    data = read_bills(bills_path)
+    # the base bundle only from the first cycle anything was recorded for, not back in time
+    first = min(data["cycles"], default=None)
+    base = data["base"] if first and cycle.start.isoformat() >= first else []
+    return Bill(cycle, base + data["cycles"].get(cycle.start.isoformat(), []), parts, laptop, kinds)
 
 
 @dataclass

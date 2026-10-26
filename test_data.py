@@ -290,6 +290,47 @@ def test_household():
     os.unlink(path)
 
 
+def test_bill():
+    print("\n== monthly bill ==")
+    import time as _t
+    bills = tempfile.mktemp(suffix=".json")
+    cycle = nd.period_for("cycle", date.today(), 27)
+    key = cycle.start.isoformat()
+    nd.add_bundle(None, 250, 200, 0, bills)               # the base, every cycle
+    nd.add_bundle(key, 100, 150, 10, bills)
+    nd.add_bundle(key, 100, 150, 10, bills)
+    nd.add_bundle(key, 60, 100, 10, bills)
+    got = nd.read_bills(bills)["cycles"][key]
+    check("fee is added to the bundle price", got[0]["egp"], 165.0)
+    check("three extras kept for the cycle", len(got), 3)
+
+    path = tempfile.mktemp(suffix=".db")
+    store = collector.Store(path)
+    start = int(_t.mktime(cycle.start.timetuple()))
+    hour = lambda ts: datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H")
+    store.add_network(hour(start + 3600), "ap:home", 102 * GB, 0)
+    store.add_app(cycle.start.isoformat(), "pip", 60 * GB, 0)
+    store.add_app(cycle.start.isoformat(), "assistant-cli", 30 * GB, 0)
+    store.add_app(cycle.start.isoformat(), "chrome", 12 * GB, 0)
+    for k, v in (("phone_plan_gb", 250), ("phone_plan_key", "ap:home"), ("phone_cycle_day", 27)):
+        store.set_meta(k, v)
+    store.commit()
+    b = nd.bill(nd.connect(path), 25, date.today(), {"labels": {}, "merge": {}}, bills)
+    check("cost is every bundle bought", b.cost, 640.0)
+    check("GB bought", b.gb_bought, 510)
+    check("price per GB", round(b.per_gb, 4), round(640.0 / 510, 4))
+    check("the laptop's share is its GB at that price", b.share_egp, round(102 * 640.0 / 510, 2))
+    kinds = dict((k, v) for k, v, _ in b.kinds)
+    check("apps are grouped by kind", kinds, {"Packages and builds": 60 * GB,
+                                              "Coding assistants": 30 * GB, "Browser": 12 * GB})
+    check("a cycle with no bundles costs nothing", nd.bill(nd.connect(path), 25,
+          date.today() - timedelta(days=62), {"labels": {}, "merge": {}}, bills).cost, 0)
+    check("a later cycle with no extras still pays the base", nd.bill(nd.connect(path), 25,
+          date.today() + timedelta(days=31), {"labels": {}, "merge": {}}, bills).cost, 200)
+    os.unlink(path)
+    os.unlink(bills)
+
+
 def _empty_db():
     path = tempfile.mktemp(suffix=".db")
     collector.Store(path).commit()
@@ -305,6 +346,7 @@ if __name__ == "__main__":
     test_labels()
     test_networks()
     test_household()
+    test_bill()
     print("\n" + ("ALL TESTS PASSED" if not FAILS
                   else f"{len(FAILS)} FAILURE(S): {FAILS}"))
     sys.exit(1 if FAILS else 0)

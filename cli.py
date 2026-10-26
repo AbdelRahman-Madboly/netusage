@@ -3,6 +3,7 @@
 
 import configparser
 import os
+import subprocess
 import sqlite3
 import sys
 import time
@@ -441,7 +442,70 @@ def cmd_networks(db, cfg, args):
     print()
 
 
+def cmd_bill(db, cfg, args):
+    """What the cycle's bundles cost and the laptop's share: the laptop's GB on the
+    home plan at the price per GB bought. `bill add GB PRICE [--fee P]` records a bundle."""
+    sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+    import netusage_data as nd
+    cycle_day = int(meta(db, "phone_cycle_day", 0) or meta(db, "cycle_day", cfg["cycle_day"]))
+    anchor = nd.shift(nd.period_for("cycle", date.today(), cycle_day), -args.back, cycle_day).start
+    if args.rest[:1] in (["add"], ["base"]):
+        gb, price = float(args.rest[1]), float(args.rest[2])
+        start = nd.period_for("cycle", anchor, cycle_day).start.isoformat()
+        if args.rest[0] == "base":
+            rows = nd.add_bundle(None, gb, price, args.fee)
+            print(f"\n  every cycle now comes with {gb:g} GB for {rows[-1]['egp']:.2f} EGP\n")
+        else:
+            rows = nd.add_bundle(start, gb, price, args.fee)
+            print(f"\n  added {gb:g} GB for {rows[-1]['egp']:.2f} EGP to the cycle from {start}\n")
+        return
+    b = nd.bill(db, cycle_day, anchor)
+    if args.notify:
+        span = f"{b.cycle.start:%d %b} – {b.cycle.end - timedelta(days=1):%d %b}"
+        body = (f"Laptop share {b.share_egp:.2f} EGP for {span}: laptop {b.laptop / 1024 ** 3:.1f} GB "
+                f"× {b.per_gb:.2f} EGP/GB. Details: netusage bill -b {args.back}") if b.bundles else \
+            f"No bundles recorded for {span}. Add them: netusage bill add GB PRICE --fee 14"
+        subprocess.run(["notify-send", "-i", "com.madboly.NetUsage", "Internet bill", body], check=False)
+        print(body)
+        return
+    gb = lambda n: f"{n / 1024 ** 3:7.1f} GB"
+    end = b.cycle.end - timedelta(days=1)
+    print()
+    print(f"  {BOLD('internet bill')}  {DIM(b.cycle.start.strftime('%d %b') + ' → ' + end.strftime('%d %b %Y'))}")
+    print()
+    if not b.bundles:
+        print(f"  {YELLOW('no bundles recorded for this cycle')}")
+        print(f"  {DIM('add each one:  netusage bill add GB PRICE --fee 14')}\n")
+    else:
+        for x in b.bundles:
+            print(f"  bundle  {x['gb']:>5g} GB  {x['egp']:>9.2f} EGP")
+        print(f"  {BOLD('paid')}    {b.gb_bought:>5g} GB  {b.cost:>9.2f} EGP   "
+              f"= {b.per_gb:.2f} EGP per GB")
+        print()
+    if b.parts:
+        names = {"Laptop": "Laptop (shared)", "Phone": "My phone", "Family": "Others (not tracked)"}
+        used = sum(v for _, v in b.parts)
+        print(f"  {BOLD('on the home plan')}")
+        for name, v in b.parts:
+            share = f"{v * 100 / used:3.0f}%" if used else ""
+            egp = f"{v / 1024 ** 3 * b.per_gb:8.2f} EGP" if b.bundles else ""
+            print(f"  {names.get(name, name):<22} {gb(v)}  {share}  {egp}")
+        if b.bundles:
+            print(f"  {'unused':<22} {gb(max(0, b.gb_bought * 1024 ** 3 - used))}")
+        print()
+    if b.bundles:
+        print(f"  {BOLD('Laptop share')}  {b.laptop / 1024 ** 3:.1f} GB × {b.per_gb:.2f} = "
+              f"{GREEN(f'{b.share_egp:.2f} EGP')}")
+        print()
+    print(f"  {BOLD('what the laptop used it for')}  {DIM('(all networks)')}")
+    for kind, total, rows in b.kinds:
+        top = ", ".join(f"{n} {v / 1024 ** 3:.1f}" for n, v in rows[:4] if v >= 0.05 * 1024 ** 3)
+        print(f"  {kind:<22} {gb(total)}  {DIM(top)}")
+    print()
+
+
 COMMANDS = {
+    "bill": cmd_bill,
     "report": cmd_report,
     "today": cmd_today,
     "apps": cmd_apps,
@@ -463,8 +527,13 @@ HELP = """
   netusage networks   this cycle per Wi-Fi router / wired network
   netusage status     collector health and backend in use
   netusage live       live throughput, Ctrl-C to stop
+  netusage bill       the cycle's cost and the laptop's share (laptop GB × price per GB)
+  netusage bill add GB PRICE --fee 14   record an extra bundle bought this cycle
+  netusage bill base GB PRICE           the bundle every cycle comes with
+  netusage bill -b 1 --notify           last cycle's laptop share as a notification
 
   options
+    -b N              bill: N cycles back (default 0, this cycle)
     -n N              limit application rows (default 12)
     -i N              poll seconds for `live` (default 3)
 """
@@ -474,6 +543,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("command", nargs="?", default="report")
+    parser.add_argument("rest", nargs="*")
+    parser.add_argument("-b", "--back", type=int, default=0)
+    parser.add_argument("--fee", type=float, default=0)
+    parser.add_argument("--notify", action="store_true")
     parser.add_argument("-n", "--limit", type=int, default=12)
     parser.add_argument("-i", "--interval", type=int, default=3)
     parser.add_argument("-h", "--help", action="store_true")

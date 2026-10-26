@@ -30,6 +30,18 @@ netusage cycles    # previous billing cycles
 netusage networks  # this cycle per Wi-Fi router / wired network
 netusage status    # collector health and which backend is active
 netusage live      # live throughput, Ctrl-C to stop
+netusage bill      # the cycle's cost and the laptop's share
+```
+
+**Bill.** `netusage bill` splits what the cycle's bundles cost: the price per GB
+bought (total paid / GB bought) times each device's GB on the home plan.
+The laptop's part is split off; unused GB stay with me. The bundle every cycle
+comes with is set once (`netusage bill base 250 250`), extras are added when
+bought (`netusage bill add 100 190 --fee 14`, the fee added to the price), and
+`-b 1` shows the previous cycle. Prices live in `~/.config/netusage/bills.json`.
+Below the split, the laptop's GB are grouped by kind of application.
+
+```sh
 ```
 
 `-n N` limits application rows; `-i N` sets the poll interval for `live`.

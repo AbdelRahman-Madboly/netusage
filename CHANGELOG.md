@@ -1,18 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- The bill split is generic: the laptop's line takes its name from `share_label` in the bills
+  file, and `netusage bill add` and `base` record bundles again.
+- Application kinds for the bill can be extended from `~/.config/netusage/app_kinds.json`;
+  `app_kinds.example.json` shows the format.
+- Extra process names can be folded together from an `[aliases]` section in
+  `/etc/netusage.conf`.
+- Design notes no longer carry usage figures from the original machine.
+- Released under the MIT license with the author's full name; CI runs both Python test
+  scripts and the phone app's tests and debug build.
+
 ## v1.0.0 - 2026-11-01
 
 First finished version. Merges `feat/bill-json` into `main`.
 
 ### Added
-- `netusage bill --json`: the cycle's cost split as data, for the Bills app.
+- `netusage bill --json`: the cycle's cost split as data.
 - Unit tests for application kinds, a missing or corrupt bills file, network labels, byte
   formatting and totals on the phone app.
 - MIT license, a Tests section and a "What it does not do" section in the README.
 
 ### Changed
-- Bundles and their prices are recorded in the Bills app; `netusage bill add` and `base` point
-  there instead of writing prices themselves.
+- Bundle prices could be kept by another tool in the bills file.
 - The dashboard launcher and window are named Internet Usage.
 
 ## Before v1.0.0

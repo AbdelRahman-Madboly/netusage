@@ -190,16 +190,11 @@ for day in bad:
 if bad:
     print(f"==> repaired per-app data for: {', '.join(bad)}")
 
-# Older collectors recorded two names the classifier now resolves: the
-# versioned assistant-cli binary (~/.local/share/assistant/versions/2.1.260) under
-# its version number, and Chrome threads under their thread name once the
-# process had exited. Fold those rows into the names used from now on.
-import re
+# Older collectors recorded Chrome threads under their thread name once the
+# process had exited. Fold those rows into the name used from now on.
 renames = {}
 for (app,) in db.execute("SELECT DISTINCT app FROM app_daily"):
-    if re.fullmatch(r"\d+(\.\d+)+", app):
-        renames[app] = "assistant-cli"
-    elif app.startswith(("Chrome_", "chrome_")):
+    if app.startswith(("Chrome_", "chrome_")):
         renames[app] = "chrome"
 for old, new in renames.items():
     db.execute("""

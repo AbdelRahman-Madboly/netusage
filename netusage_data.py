@@ -726,13 +726,16 @@ def household(db, cycle_day, prefs=None, anchor=None):
 # monthly bill: what the bundles cost and the laptop's share of it
 # --------------------------------------------------------------------------
 
-# Prices are mine, not the collector's, so they live in my home, not /var/lib.
+# Prices belong to the user, not the collector, so they live in the user's home, not /var/lib.
 BILLS_PATH = os.environ.get("NETUSAGE_BILLS", os.path.expanduser("~/.config/netusage/bills.json"))
+# Extra application kinds, checked before the built-in ones. A JSON list of
+# [kind, [names]] pairs; see app_kinds.example.json. Missing means none.
+APP_KINDS_PATH = os.environ.get("NETUSAGE_APP_KINDS",
+                                os.path.expanduser("~/.config/netusage/app_kinds.json"))
 
 # The laptop's applications grouped so the bill says what the GB were for.
 # First match wins; a name ending in "*" matches by prefix.
 APP_KINDS = [
-    ("Coding assistants", ["assistant-cli", "assistant", "assistant-desktop", "code-agent", "chat-client", "local-llm"]),
     ("Packages and builds", ["pip", "uv", "npm", "pnpm", "yarn", "git", "docker", "gradle*",
                              "java", "cargo", "go", "curl", "wget", "rclone", "trivy"]),
     ("Dev servers and tests", ["postgres", "jest", "next-server*", "node", "ssh", "code",
@@ -743,8 +746,22 @@ APP_KINDS = [
 OTHER_KIND = "Other"
 
 
-def app_kind(name):
-    for kind, names in APP_KINDS:
+def load_app_kinds(path=None):
+    """The user's kinds from APP_KINDS_PATH followed by the built-in ones. A missing
+    or malformed file adds nothing, so the bill never fails over it."""
+    import json
+    try:
+        with open(path or APP_KINDS_PATH) as f:
+            data = json.load(f)
+        extra = [(str(k), [str(n) for n in names]) for k, names in data
+                 if isinstance(names, list)]
+    except (OSError, ValueError, TypeError):
+        extra = []
+    return extra + APP_KINDS
+
+
+def app_kind(name, kinds=None):
+    for kind, names in (kinds if kinds is not None else APP_KINDS):
         for n in names:
             if name == n or (n.endswith("*") and name.startswith(n[:-1])):
                 return kind
@@ -752,8 +769,9 @@ def app_kind(name):
 
 
 def read_bills(path=None):
-    """{"base": [{"gb", "egp"}], "cycles": {"<cycle start>": [{"gb", "egp"}, ...]}}: the
-    bundle every cycle comes with, then the extras bought in each cycle."""
+    """{"base": [{"gb", "egp"}], "cycles": {"<cycle start>": [{"gb", "egp"}, ...]},
+    "share_label": "..."}: the bundle every cycle comes with, the extras bought in
+    each cycle, and an optional name for the laptop's share on the bill."""
     import json
     try:
         with open(path or BILLS_PATH) as f:
@@ -791,6 +809,7 @@ class Bill:
     parts: list             # household split, [(name, bytes)]; [] before the phone reports
     laptop: int             # laptop bytes on the plan's network
     kinds: list             # [(kind, bytes, [(app, bytes)])], largest first, all networks
+    share_label: str = "Laptop share"
 
     @property
     def gb_bought(self):
@@ -812,7 +831,7 @@ class Bill:
 def bill(db, cycle_day, anchor=None, prefs=None, bills_path=None):
     """The bill for the cycle containing `anchor`: what was paid, the price per GB
     bought, and the laptop's share, its GB on the plan at that price. GB left
-    unused stay with me, so the shared side pays only for what it used."""
+    unused are not charged to the laptop, so the share covers only what it used."""
     prefs = prefs or read_network_prefs()
     h = household(db, cycle_day, prefs, anchor)
     if h:
@@ -821,15 +840,17 @@ def bill(db, cycle_day, anchor=None, prefs=None, bills_path=None):
         cycle = period_for("cycle", anchor or date.today(), cycle_day)
         parts, laptop = [], sum(totals(db, cycle))
     grouped = {}
+    kind_list = load_app_kinds()
     for name, rx, tx in apps(db, cycle):
-        grouped.setdefault(app_kind(name), []).append((name, rx + tx))
+        grouped.setdefault(app_kind(name, kind_list), []).append((name, rx + tx))
     kinds = sorted(((k, sum(v for _, v in rows), sorted(rows, key=lambda r: -r[1]))
                     for k, rows in grouped.items()), key=lambda k: -k[1])
     data = read_bills(bills_path)
     # the base bundle only from the first cycle anything was recorded for, not back in time
     first = min(data["cycles"], default=None)
     base = data["base"] if first and cycle.start.isoformat() >= first else []
-    return Bill(cycle, base + data["cycles"].get(cycle.start.isoformat(), []), parts, laptop, kinds)
+    return Bill(cycle, base + data["cycles"].get(cycle.start.isoformat(), []), parts, laptop, kinds,
+                str(data.get("share_label") or "Laptop share"))
 
 
 @dataclass
@@ -940,7 +961,7 @@ def export_csv(db, period, path):
 
 
 def bill_json(b):
-    """The bill as plain data for the Bills app: bytes, GB bought, EGP, ISO dates (end exclusive)."""
+    """The bill as plain data for other tools: bytes, GB bought, cost, ISO dates (end exclusive)."""
     return {"cycle_start": b.cycle.start.isoformat(), "cycle_end": b.cycle.end.isoformat(),
             "laptop_bytes": b.laptop, "parts": dict(b.parts),
             "gb_bought": b.gb_bought, "cost_egp": b.cost}

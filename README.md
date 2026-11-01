@@ -1,7 +1,8 @@
 # Internet Usage (netusage)
 
-Tracks how much internet this laptop consumes over a billing cycle that runs
-from the 25th of one month to the 25th of the next, broken down by application.
+Tracks how much internet a Linux laptop consumes over a monthly billing cycle
+(the start day is configurable), broken down by application and by network.
+An optional Android app adds the phone's usage.
 
 A background service collects continuously; a desktop dashboard and a
 terminal command report on demand. The service is independent of any terminal, starts at boot, and
@@ -9,9 +10,13 @@ restarts itself if it dies.
 
 Design decisions, the bug log and open items are in `NOTES.md`.
 
-Status: v1.0.0, finished personal tool. The collector runs as a systemd service on this
-laptop; the `netusage` command, the dashboard and the phone app work end to end. 184 checks in
-the two Python test scripts and 16 phone app unit tests pass.
+## Status
+
+v1.0.0 plus the unreleased changes in CHANGELOG.md. Built as a personal tool and used daily on
+one Ubuntu 24.04 laptop and one Android phone; the collector, the `netusage` command, the
+dashboard and the phone app work end to end there. The two Python test scripts and the phone
+app's unit tests pass. It has not been tried on other distributions or kernels, and the
+filtered eBPF probe depends on kernel struct layouts.
 
 ## Install
 
@@ -37,13 +42,25 @@ netusage live      # live throughput, Ctrl-C to stop
 netusage bill      # the cycle's cost and the laptop's share
 ```
 
-**Bill.** `netusage bill` splits what the cycle's bundles cost: the price per GB
-bought (total paid / GB bought) times each device's GB on the home plan.
-The laptop's part is split off; unused GB stay with me. Bundles and their
-prices are recorded in the Bills app, which
-writes them to `~/.config/netusage/bills.json` for this command; `-b 1` shows
-the previous cycle and `--json` gives the same as data.
-Below the split, the laptop's GB are grouped by kind of application.
+**Shared bill split.** `netusage bill` splits what the cycle's bundles cost:
+the price per GB bought (total paid / GB bought) times each device's GB on the
+home plan, so the laptop's share can be billed to someone else (an employer
+or a housemate, say). Unused GB are not charged to the laptop.
+
+```sh
+netusage bill base 200 150 --fee 10   # every cycle comes with 200 GB for 150 (+10% fee)
+netusage bill add 50 60 --fee 10      # an extra 50 GB bought this cycle
+netusage bill -b 1                    # the previous cycle
+netusage bill --json                  # the same as data
+```
+
+Bundles are kept in `~/.config/netusage/bills.json`, which another tool may
+also write. An optional `"share_label"` key in that file renames the laptop's
+line on the bill (default "Laptop share"). Below the split, the laptop's GB
+are grouped by kind of application. The built-in kinds cover package
+managers, dev tools, browsers and system updates; add your own in
+`~/.config/netusage/app_kinds.json` (see `app_kinds.example.json`), which is
+checked first.
 
 `-n N` limits application rows; `-i N` sets the poll interval for `live`.
 
@@ -248,13 +265,16 @@ depend on eBPF at all.
 ```ini
 [general]
 interfaces     = auto      ; or a comma-separated list
-cycle_day      = 25        ; day of month the billing cycle starts
+cycle_day      = 25        ; day of month the billing cycle starts (1 to 28)
 interval       = 10        ; seconds between samples
 db             = /var/lib/netusage/netusage.db
 backend        = auto      ; auto | ebpf | nethogs | off
 daily_limit_gb = 10        ; 0 disables notifications
 notify_at      = 80,100,150,200
 ```
+
+An optional `[aliases]` section reports extra executable names under one
+name (`helper-binary = tool-name`), for tools that run several helpers.
 
 After editing: `sudo systemctl restart netusage`.
 
@@ -332,11 +352,15 @@ cd android && ./gradlew test assembleDebug
 
 - It does not block, shape or limit traffic. Limits only notify.
 - It does not read the ISP's meter. The remaining balance comes from readings typed into the
-  dashboard's ISP dialog, and bundle prices come from the Bills app.
+  dashboard's ISP dialog, and bundle prices come from `netusage bill add` or the bills file.
 - It counts only this laptop and the phones that run the phone app. Other devices on the home
   network are not seen.
 - It is built for Ubuntu with systemd. The collector needs root for eBPF; nothing is packaged
   for other distributions.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
 
 ## Limitations
 

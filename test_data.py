@@ -310,7 +310,7 @@ def test_bill():
     hour = lambda ts: datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H")
     store.add_network(hour(start + 3600), "ap:home", 102 * GB, 0)
     store.add_app(cycle.start.isoformat(), "pip", 60 * GB, 0)
-    store.add_app(cycle.start.isoformat(), "assistant-cli", 30 * GB, 0)
+    store.add_app(cycle.start.isoformat(), "gradle-daemon", 30 * GB, 0)
     store.add_app(cycle.start.isoformat(), "chrome", 12 * GB, 0)
     for k, v in (("phone_plan_gb", 250), ("phone_plan_key", "ap:home"), ("phone_cycle_day", 27)):
         store.set_meta(k, v)
@@ -321,8 +321,8 @@ def test_bill():
     check("price per GB", round(b.per_gb, 4), round(640.0 / 510, 4))
     check("the laptop's share is its GB at that price", b.share_egp, round(102 * 640.0 / 510, 2))
     kinds = dict((k, v) for k, v, _ in b.kinds)
-    check("apps are grouped by kind", kinds, {"Packages and builds": 60 * GB,
-                                              "Coding assistants": 30 * GB, "Browser": 12 * GB})
+    check("apps are grouped by kind", kinds, {"Packages and builds": 90 * GB, "Browser": 12 * GB})
+    check("the share has a default label", b.share_label, "Laptop share")
     check("a cycle with no bundles costs nothing", nd.bill(nd.connect(path), 25,
           date.today() - timedelta(days=62), {"labels": {}, "merge": {}}, bills).cost, 0)
     j = nd.bill_json(b)
@@ -351,6 +351,15 @@ def test_app_kinds_and_bills_file():
         f.write("{not json")
     check("a corrupt file reads as empty", nd.read_bills(bad), {"base": [], "cycles": {}})
     os.unlink(bad)
+    kinds_file = tempfile.mktemp(suffix=".json")
+    with open(kinds_file, "w") as f:
+        f.write('[["Media", ["vlc", "spotify*"]], ["Browser", ["my-browser"]]]')
+    kinds = nd.load_app_kinds(kinds_file)
+    check("a user kind is matched", nd.app_kind("spotify-client", kinds), "Media")
+    check("user kinds come before the built-in ones", nd.app_kind("my-browser", kinds), "Browser")
+    check("built-in kinds still apply", nd.app_kind("firefox", kinds), "Browser")
+    check("a missing kinds file adds nothing", nd.load_app_kinds(missing), nd.APP_KINDS)
+    os.unlink(kinds_file)
 
 
 def _empty_db():

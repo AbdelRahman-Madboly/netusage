@@ -73,6 +73,7 @@ def load_config():
             for key in DEFAULTS:
                 if parser.has_option("general", key):
                     cfg[key] = parser.get("general", key).strip()
+        EXE_ALIASES.update(read_aliases(parser))
     cfg["cycle_day"] = max(1, min(28, int(cfg["cycle_day"])))
     cfg["share"] = str(cfg["share"]).lower() in ("on", "yes", "true", "1")
     cfg["share_port"] = int(cfg["share_port"])
@@ -83,6 +84,15 @@ def load_config():
         if p.strip().isdigit()
     })
     return cfg
+
+
+def read_aliases(parser):
+    """Extra executable names from the [aliases] section: `exe = reported name`.
+    Lets a user fold a tool's helper binaries into one name without editing code."""
+    if not parser.has_section("aliases"):
+        return {}
+    return {k.strip().lower(): v.strip() for k, v in parser.items("aliases")
+            if k.strip() and v.strip()}
 
 
 def _percent_list(raw):
@@ -492,7 +502,6 @@ def _starttime(pid):
 
 # Executable name -> reported name. Exact match on the basename of argv[0].
 EXE_ALIASES = {
-    "assistant": "assistant-cli",
     "google-chrome": "chrome", "google-chrome-stable": "chrome",
     "chrome": "chrome", "chromium": "chrome", "chromium-browser": "chrome",
     "chrome_crashpad_handler": "chrome", "chrome-sandbox": "chrome",
@@ -511,7 +520,6 @@ EXE_ALIASES = {
 # Substring match on the whole command line. Only distinctive markers, checked
 # after the exact-name table so a rename of the binary cannot mislead them.
 CMDLINE_RULES = [
-    ("assistant-cli", ("@example/assistant-cli", "assistant-cli", "/bin/assistant")),
     ("chrome", ("/google-chrome", "/chromium")),
     ("vscode", ("vscode-server", "/usr/share/code", ".vscode-server")),
     ("apt", ("/usr/lib/apt/", "unattended-upgr")),
@@ -534,7 +542,7 @@ GENERIC_DIRS = {"bin", ".bin", "src", "lib", "dist", "build", "out",
 _STRIP_SUFFIX = re.compile(r"(\.bin|-real|-wrapper|\.sh|\.js|\.py|\.ts)$")
 
 # Versioned installs run a binary named after its version
-# (~/.local/share/assistant/versions/2.1.260). The name is the directory above.
+# (~/.local/share/<tool>/versions/1.2.3). The name is the directory above.
 _VERSION = re.compile(r"^\d+(\.\d+)+$")
 VERSION_DIRS = {"versions", "version", "releases"}
 

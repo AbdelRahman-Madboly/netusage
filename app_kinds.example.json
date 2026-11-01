@@ -1,0 +1,4 @@
+[
+  ["Media", ["vlc", "spotify*", "mpv"]],
+  ["Chat", ["slack", "discord", "telegram-desktop"]]
+]

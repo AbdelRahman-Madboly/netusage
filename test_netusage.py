@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for netusage. Run: python3 test_netusage.py  (no root needed)"""
 
+import configparser
 import os
 import re
 import sys
@@ -160,8 +161,6 @@ def test_classify():
     case([], "cpuhp/2", "cpuhp/2")
     case([], "nvidia-drm/timeline-23", "nvidia-drm/timeline-23")
     case(["postgres: walwriter"], "postgres", "postgres")
-    case(["assistant", "--continue"], "assistant", "assistant-cli")
-    case(["/home/u/.local/bin/assistant"], "assistant", "assistant-cli")
     case(["/opt/google/chrome/chrome", "--type=renderer"], "chrome", "chrome")
     case(["/opt/google/chrome/chrome_crashpad_handler"], "chrome_crashp", "chrome")
     case(["/usr/lib/firefox/firefox", "-contentproc"], "Web Content", "firefox")
@@ -174,8 +173,8 @@ def test_classify():
     case(["python3.12"], "python3", "python3")
     case(["/usr/bin/ssh", "host"], "ssh", "ssh")
     case(["/usr/bin/qemu-system-x86_64"], "qemu", "qemu-system-x86_64")
-    case(["/home/u/.local/share/assistant/versions/2.1.260", "--print"],
-         "2.1.260", "assistant-cli")
+    case(["/home/u/.local/share/acme-cli/versions/2.1.260", "--print"],
+         "2.1.260", "acme-cli")
     case(["/opt/tool/versions/1.4/tool-agent"], "tool-agent", "tool-agent")
     case(["/opt/acme/releases/3.2.1"], "3.2.1", "acme")
     case(["node", "/home/u/.cache/foo/versions/1.2.3/index.js"], "node", "foo")
@@ -379,14 +378,36 @@ def test_apps_bounded_by_interfaces():
           collector.bound_apps({"x": (1000, 1000)}, 0, 0), {"x": (1000, 1000)})
 
 
-def test_bundles_are_recorded_in_bills():
-    print("\n== bundles go in the Bills app ==")
-    import argparse, io, contextlib
-    out = io.StringIO()
-    args = argparse.Namespace(rest=["add", "100", "190"], back=0, fee=14, json=False, notify=False)
-    with contextlib.redirect_stdout(out):
-        cli.cmd_bill(None, {}, args)
-    check("bill add points to Bills", "Bills" in out.getvalue(), True)
+def test_bill_add_writes_bills_file():
+    print("\n== bill add and base write the bills file ==")
+    import argparse, io, contextlib, json, tempfile
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import netusage_data as nd
+    path = tempfile.mktemp(suffix=".json")
+    saved, nd.BILLS_PATH = nd.BILLS_PATH, path
+    try:
+        for rest, fee in ((["base", "200", "100"], 0), (["add", "50", "100"], 10)):
+            args = argparse.Namespace(rest=rest, back=0, fee=fee, json=False, notify=False)
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.cmd_bill(None, {"cycle_day": 1}, args)
+        with open(path) as f:
+            data = json.load(f)
+        check("base bundle recorded", data["base"], [{"gb": 200.0, "egp": 100.0}])
+        check("extra bundle recorded with its fee",
+              [r for rows in data["cycles"].values() for r in rows], [{"gb": 50.0, "egp": 110.0}])
+    finally:
+        nd.BILLS_PATH = saved
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_aliases_from_config():
+    print("\n== aliases from the config ==")
+    parser = configparser.ConfigParser()
+    parser.read_string("[aliases]\nMy-Helper = my-tool\nempty =\n")
+    check("aliases are read lower-case and blanks skipped",
+          collector.read_aliases(parser), {"my-helper": "my-tool"})
+    check("no section, no aliases", collector.read_aliases(configparser.ConfigParser()), {})
 
 
 if __name__ == "__main__":
@@ -401,7 +422,8 @@ if __name__ == "__main__":
     test_loop_paces()
     test_formatting()
     test_apps_bounded_by_interfaces()
-    test_bundles_are_recorded_in_bills()
+    test_bill_add_writes_bills_file()
+    test_aliases_from_config()
     print("\n" + ("ALL TESTS PASSED" if not FAILS
                   else f"{len(FAILS)} FAILURE(S): {FAILS}"))
     sys.exit(1 if FAILS else 0)

@@ -445,14 +445,12 @@ def cmd_networks(db, cfg, args):
 def cmd_bill(db, cfg, args):
     """What the cycle's bundles cost and the laptop's share: the laptop's GB on the
     home plan at the price per GB bought. `bill add GB PRICE [--fee P]` records a bundle."""
-    if args.rest[:1] in (["add"], ["base"]):
-        # Bills writes the price file from the bundles recorded there; one written here would be lost.
-        print("\n  Record bundles in the Bills app (Add charge, Home internet, with its Bundle size).\n"
-              "  It keeps this tool's prices in step.\n")
-        return
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import netusage_data as nd
-    cycle_day = int(meta(db, "phone_cycle_day", 0) or meta(db, "cycle_day", cfg["cycle_day"]))
+    if db is None:
+        cycle_day = int(cfg.get("cycle_day", 1))
+    else:
+        cycle_day = int(meta(db, "phone_cycle_day", 0) or meta(db, "cycle_day", cfg["cycle_day"]))
     anchor = nd.shift(nd.period_for("cycle", date.today(), cycle_day), -args.back, cycle_day).start
     if args.rest[:1] in (["add"], ["base"]):
         gb, price = float(args.rest[1]), float(args.rest[2])
@@ -471,7 +469,7 @@ def cmd_bill(db, cfg, args):
         return
     if args.notify:
         span = f"{b.cycle.start:%d %b} – {b.cycle.end - timedelta(days=1):%d %b}"
-        body = (f"Laptop share {b.share_egp:.2f} EGP for {span}: laptop {b.laptop / 1024 ** 3:.1f} GB "
+        body = (f"{b.share_label} {b.share_egp:.2f} EGP for {span}: laptop {b.laptop / 1024 ** 3:.1f} GB "
                 f"× {b.per_gb:.2f} EGP/GB. Details: netusage bill -b {args.back}") if b.bundles else \
             f"No bundles recorded for {span}. Add them: netusage bill add GB PRICE --fee 14"
         subprocess.run(["notify-send", "-i", "com.madboly.NetUsage", "Internet bill", body], check=False)
@@ -492,7 +490,7 @@ def cmd_bill(db, cfg, args):
               f"= {b.per_gb:.2f} EGP per GB")
         print()
     if b.parts:
-        names = {"Laptop": "Laptop (shared)", "Phone": "My phone", "Family": "Others (not tracked)"}
+        names = {"Laptop": "Laptop", "Phone": "My phone", "Family": "Others (not tracked)"}
         used = sum(v for _, v in b.parts)
         print(f"  {BOLD('on the home plan')}")
         for name, v in b.parts:
@@ -503,7 +501,7 @@ def cmd_bill(db, cfg, args):
             print(f"  {'unused':<22} {gb(max(0, b.gb_bought * 1024 ** 3 - used))}")
         print()
     if b.bundles:
-        print(f"  {BOLD('Laptop share')}  {b.laptop / 1024 ** 3:.1f} GB × {b.per_gb:.2f} = "
+        print(f"  {BOLD(b.share_label)}  {b.laptop / 1024 ** 3:.1f} GB × {b.per_gb:.2f} = "
               f"{GREEN(f'{b.share_egp:.2f} EGP')}")
         print()
     print(f"  {BOLD('what the laptop used it for')}  {DIM('(all networks)')}")
@@ -537,9 +535,10 @@ HELP = """
   netusage status     collector health and backend in use
   netusage live       live throughput, Ctrl-C to stop
   netusage bill       the cycle's cost and the laptop's share (laptop GB × price per GB)
-  (bundles and their prices are recorded in the Bills app)
+  netusage bill add GB PRICE [--fee P]  record an extra bundle bought this cycle
+  netusage bill base GB PRICE [--fee P] set the bundle every cycle comes with
   netusage bill -b 1 --notify           last cycle's laptop share as a notification
-  netusage bill -b 1 --json             the same as data, for the Bills app
+  netusage bill -b 1 --json             the same as data, for other tools
 
   options
     -b N              bill: N cycles back (default 0, this cycle)

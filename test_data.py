@@ -337,6 +337,22 @@ def test_bill():
     os.unlink(bills)
 
 
+def test_app_kinds_and_bills_file():
+    print("\n== app kinds and the bills file ==")
+    check("exact name", nd.app_kind("firefox"), "Browser")
+    check("prefix pattern", nd.app_kind("gradle-daemon"), "Packages and builds")
+    check("first match wins", nd.app_kind("python3"), "Dev servers and tests")
+    check("unknown is Other", nd.app_kind("some-app"), nd.OTHER_KIND)
+    check("a pattern does not match a longer exact name", nd.app_kind("gitk"), nd.OTHER_KIND)
+    missing = tempfile.mktemp(suffix=".json")
+    check("a missing file reads as empty", nd.read_bills(missing), {"base": [], "cycles": {}})
+    bad = tempfile.mktemp(suffix=".json")
+    with open(bad, "w") as f:
+        f.write("{not json")
+    check("a corrupt file reads as empty", nd.read_bills(bad), {"base": [], "cycles": {}})
+    os.unlink(bad)
+
+
 def _empty_db():
     path = tempfile.mktemp(suffix=".db")
     collector.Store(path).commit()
@@ -353,6 +369,7 @@ if __name__ == "__main__":
     test_networks()
     test_household()
     test_bill()
+    test_app_kinds_and_bills_file()
     print("\n" + ("ALL TESTS PASSED" if not FAILS
                   else f"{len(FAILS)} FAILURE(S): {FAILS}"))
     sys.exit(1 if FAILS else 0)

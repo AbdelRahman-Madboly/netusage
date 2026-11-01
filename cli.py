@@ -445,6 +445,11 @@ def cmd_networks(db, cfg, args):
 def cmd_bill(db, cfg, args):
     """What the cycle's bundles cost and the laptop's share: the laptop's GB on the
     home plan at the price per GB bought. `bill add GB PRICE [--fee P]` records a bundle."""
+    if args.rest[:1] in (["add"], ["base"]):
+        # Bills writes the price file from the bundles recorded there; one written here would be lost.
+        print("\n  Record bundles in the Bills app (Add charge, Home internet, with its Bundle size).\n"
+              "  It keeps this tool's prices in step.\n")
+        return
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     import netusage_data as nd
     cycle_day = int(meta(db, "phone_cycle_day", 0) or meta(db, "cycle_day", cfg["cycle_day"]))
@@ -460,6 +465,10 @@ def cmd_bill(db, cfg, args):
             print(f"\n  added {gb:g} GB for {rows[-1]['egp']:.2f} EGP to the cycle from {start}\n")
         return
     b = nd.bill(db, cycle_day, anchor)
+    if args.json:
+        import json
+        print(json.dumps(nd.bill_json(b)))
+        return
     if args.notify:
         span = f"{b.cycle.start:%d %b} – {b.cycle.end - timedelta(days=1):%d %b}"
         body = (f"Laptop share {b.share_egp:.2f} EGP for {span}: laptop {b.laptop / 1024 ** 3:.1f} GB "
@@ -528,9 +537,9 @@ HELP = """
   netusage status     collector health and backend in use
   netusage live       live throughput, Ctrl-C to stop
   netusage bill       the cycle's cost and the laptop's share (laptop GB × price per GB)
-  netusage bill add GB PRICE --fee 14   record an extra bundle bought this cycle
-  netusage bill base GB PRICE           the bundle every cycle comes with
+  (bundles and their prices are recorded in the Bills app)
   netusage bill -b 1 --notify           last cycle's laptop share as a notification
+  netusage bill -b 1 --json             the same as data, for the Bills app
 
   options
     -b N              bill: N cycles back (default 0, this cycle)
@@ -547,6 +556,7 @@ def main():
     parser.add_argument("-b", "--back", type=int, default=0)
     parser.add_argument("--fee", type=float, default=0)
     parser.add_argument("--notify", action="store_true")
+    parser.add_argument("--json", action="store_true")
     parser.add_argument("-n", "--limit", type=int, default=12)
     parser.add_argument("-i", "--interval", type=int, default=3)
     parser.add_argument("-h", "--help", action="store_true")

@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Net Usage - desktop dashboard for the netusage collector.
+"""Internet Usage - desktop dashboard for the netusage collector.
 
 Reads the collector's SQLite database read-only and never needs root. Live
 throughput comes straight from the kernel interface counters in /sys.
@@ -158,7 +158,7 @@ def page_box():
 
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="Net Usage",
+        super().__init__(application=app, title="Internet Usage",
                          default_width=1180, default_height=860)
         self.set_size_request(360, 480)
         self.set_icon_name(APP_ID)
@@ -248,7 +248,7 @@ class Window(Adw.ApplicationWindow):
         section = Gio.Menu()
         section.append("Preferences", "app.preferences")
         section.append("Keyboard Shortcuts", "win.show-help-overlay")
-        section.append("About Net Usage", "app.about")
+        section.append("About Internet Usage", "app.about")
         menu.append_section(None, section)
         return Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu,
                               tooltip_text="Main menu", primary=True)
@@ -1696,7 +1696,7 @@ class Preferences(Adw.PreferencesDialog):
             body = "Daily notifications are off."
         if lim["cycle_limit_gb"]:
             body += f" Plan: {lim['cycle_limit_gb']:g} GB per cycle."
-        if send_notification("Net Usage notifications work", body):
+        if send_notification("Internet Usage notifications work", body):
             self.add_toast(Adw.Toast(title="Test notification sent"))
         else:
             self.add_toast(Adw.Toast(title="Could not send: is notify-send installed?"))
@@ -1739,7 +1739,7 @@ class NetUsageApp(Adw.Application):
 
     def _about(self, *_):
         about = Adw.AboutDialog(
-            application_name="Net Usage", application_icon=APP_ID, version=VERSION,
+            application_name="Internet Usage", application_icon=APP_ID, version=VERSION,
             developer_name="AbdelRahman Madboly",
             comments="How much internet this computer uses, by day, week, month and "
                      "billing cycle, and which applications use it.",
@@ -1751,7 +1751,7 @@ class NetUsageApp(Adw.Application):
 
 def main():
     GLib.set_prgname(APP_ID)
-    GLib.set_application_name("Net Usage")
+    GLib.set_application_name("Internet Usage")
     return NetUsageApp().run(sys.argv)
 
 

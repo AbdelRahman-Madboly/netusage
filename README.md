@@ -1,4 +1,4 @@
-# netusage
+# Internet Usage (netusage)
 
 Tracks how much internet this laptop consumes over a billing cycle that runs
 from the 25th of one month to the 25th of the next, broken down by application.
@@ -8,6 +8,10 @@ terminal command report on demand. The service is independent of any terminal, s
 restarts itself if it dies.
 
 Design decisions, the bug log and open items are in `NOTES.md`.
+
+Status: v1.0.0, finished personal tool. The collector runs as a systemd service on this
+laptop; the `netusage` command, the dashboard and the phone app work end to end. 184 checks in
+the two Python test scripts and 16 phone app unit tests pass.
 
 ## Install
 
@@ -35,14 +39,11 @@ netusage bill      # the cycle's cost and the laptop's share
 
 **Bill.** `netusage bill` splits what the cycle's bundles cost: the price per GB
 bought (total paid / GB bought) times each device's GB on the home plan.
-The laptop's part is split off; unused GB stay with me. The bundle every cycle
-comes with is set once (`netusage bill base 250 250`), extras are added when
-bought (`netusage bill add 100 190 --fee 14`, the fee added to the price), and
-`-b 1` shows the previous cycle. Prices live in `~/.config/netusage/bills.json`.
+The laptop's part is split off; unused GB stay with me. Bundles and their
+prices are recorded in the Bills app, which
+writes them to `~/.config/netusage/bills.json` for this command; `-b 1` shows
+the previous cycle and `--json` gives the same as data.
 Below the split, the laptop's GB are grouped by kind of application.
-
-```sh
-```
 
 `-n N` limits application rows; `-i N` sets the poll interval for `live`.
 
@@ -53,7 +54,7 @@ Below the split, the laptop's GB are grouped by kind of application.
 ./install-gui.sh --remove    # take it off again
 ```
 
-Installs a **Net Usage** launcher on the desktop and in the applications menu.
+Installs an **Internet Usage** launcher on the desktop and in the applications menu.
 It is a GTK 4 / libadwaita app that reads the collector's database read-only,
 so it needs no root and cannot disturb collection. It refreshes every 10
 seconds.
@@ -136,7 +137,7 @@ usage. The limit is a warning only; nothing is throttled or blocked.
 network interfaces, read every 10 seconds and stored as per-day deltas.
 
 - It does not matter which WiFi network you are on. Home, a phone hotspot, a
-  café — all of it lands in the same total, because the counter belongs to the
+  café: all of it lands in the same total, because the counter belongs to the
   interface, not the network.
 - Only physical interfaces are counted. This machine has around 23 virtual
   ones (`docker0`, `br-*`, `veth*`, `tailscale0`); counting those would inflate
@@ -224,17 +225,17 @@ of git.
 
 Per-application accounting picks the first that works:
 
-1. `probe_filtered.bt` — eBPF with the physical-interface filter described
+1. `probe_filtered.bt`: eBPF with the physical-interface filter described
    above, using the map print format. The collector fills in the interfaces'
    `ifindex` values at start-up, so an adapter plugged in later is outside the
    filter until `sudo systemctl restart netusage`. If it fails to attach
    within 15 seconds, the unfiltered probes below take over.
-2. `probe_for.bt` — eBPF iterating the map with `for`, which needs
+2. `probe_for.bt`: eBPF iterating the map with `for`, which needs
    **bpftrace 0.21**. Ubuntu 24.04 ships 0.20.2, so this is skipped here: the
    installed version is checked first rather than attempted and logged as a
    syntax error on every start.
-3. `probe_print.bt` — eBPF using the map print format, unfiltered.
-4. `nethogs` — pcap-based fallback
+3. `probe_print.bt`: eBPF using the map print format, unfiltered.
+4. `nethogs`: pcap-based fallback
 
 `netusage status` reports which is active ("physical NICs only" for the
 filtered probe). If all fail, the interface total still works: it does not
@@ -313,8 +314,29 @@ sleep; it is niced and set to idle I/O priority so it yields to anything else
 wanting the disk.
 
 `python3 test_netusage.py` includes a check that the collector stays under 5%
-of a core, because a busy loop here is invisible in the recorded totals — the
+of a core, because a busy loop here is invisible in the recorded totals: the
 numbers stay correct while the CPU burns.
+
+## Tests
+
+No root and no display needed; the eBPF probes themselves are not run, only the parsing and
+accounting around them.
+
+```sh
+python3 test_netusage.py   # collector, classifier, limits, CLI formatting, bill command
+python3 test_data.py       # dashboard query layer, periods, networks, bill split
+cd android && ./gradlew test assembleDebug
+```
+
+## What it does not do
+
+- It does not block, shape or limit traffic. Limits only notify.
+- It does not read the ISP's meter. The remaining balance comes from readings typed into the
+  dashboard's ISP dialog, and bundle prices come from the Bills app.
+- It counts only this laptop and the phones that run the phone app. Other devices on the home
+  network are not seen.
+- It is built for Ubuntu with systemd. The collector needs root for eBPF; nothing is packaged
+  for other distributions.
 
 ## Limitations
 

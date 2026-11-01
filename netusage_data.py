@@ -937,3 +937,10 @@ def export_csv(db, period, path):
             w.writerow(["day", d.isoformat(), rx, tx, rx + tx])
         for app, rx, tx in apps(db, period):
             w.writerow(["app", app, rx, tx, rx + tx])
+
+
+def bill_json(b):
+    """The bill as plain data for the Bills app: bytes, GB bought, EGP, ISO dates (end exclusive)."""
+    return {"cycle_start": b.cycle.start.isoformat(), "cycle_end": b.cycle.end.isoformat(),
+            "laptop_bytes": b.laptop, "parts": dict(b.parts),
+            "gb_bought": b.gb_bought, "cost_egp": b.cost}

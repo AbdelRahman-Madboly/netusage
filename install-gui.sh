@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install (or update) the Net Usage dashboard for the current user.
+# Install (or update) the Internet Usage dashboard for the current user.
 # No root needed: everything goes under ~/.local and ~/Desktop.
 # The collector itself is installed separately with: sudo ./install.sh
 set -euo pipefail
@@ -22,7 +22,7 @@ fi
 
 if [ "${1:-}" = "--remove" ]; then
     rm -rf "$DEST"
-    rm -f "$ICON_DIR/$APP_ID.svg" "$APPS_DIR/$APP_ID.desktop" "$DESKTOP_DIR/Net Usage.desktop"
+    rm -f "$ICON_DIR/$APP_ID.svg" "$APPS_DIR/$APP_ID.desktop" "$DESKTOP_DIR/Internet Usage.desktop"
     update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
     say "dashboard removed (settings kept in ~/.config/netusage)"
     exit 0
@@ -52,7 +52,7 @@ desktop_entry() {
     cat <<EOF
 [Desktop Entry]
 Type=Application
-Name=Net Usage
+Name=Internet Usage
 GenericName=Data Usage Monitor
 Comment=Internet usage by day, week, month and billing cycle, and by application
 Exec=$PYTHON "$DEST/netusage_dashboard.py"
@@ -73,7 +73,7 @@ update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
 
 if [ -d "$DESKTOP_DIR" ]; then
     say "adding launcher to $DESKTOP_DIR"
-    launcher="$DESKTOP_DIR/Net Usage.desktop"
+    launcher="$DESKTOP_DIR/Internet Usage.desktop"
     desktop_entry > "$launcher"
     chmod 0755 "$launcher"
     # GNOME's desktop icons only launch entries marked as trusted
@@ -85,4 +85,4 @@ if [ ! -r /var/lib/netusage/netusage.db ]; then
     echo "  The collector has no data yet. Install it with:  sudo ./install.sh"
 fi
 echo
-say "done. Open \"Net Usage\" from the desktop or the applications menu."
+say "done. Open \"Internet Usage\" from the desktop or the applications menu."

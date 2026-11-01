@@ -325,10 +325,32 @@ def test_bill():
                                               "Coding assistants": 30 * GB, "Browser": 12 * GB})
     check("a cycle with no bundles costs nothing", nd.bill(nd.connect(path), 25,
           date.today() - timedelta(days=62), {"labels": {}, "merge": {}}, bills).cost, 0)
+    j = nd.bill_json(b)
+    check("json carries the laptop bytes", j["laptop_bytes"], b.laptop)
+    check("json carries cost and GB bought", (j["cost_egp"], j["gb_bought"]), (640.0, 510))
+    check("json cycle is ISO with an exclusive end",
+          (j["cycle_start"], j["cycle_end"]), (b.cycle.start.isoformat(), b.cycle.end.isoformat()))
+    check("json parts by name", j["parts"].get("Laptop"), b.laptop)
     check("a later cycle with no extras still pays the base", nd.bill(nd.connect(path), 25,
           date.today() + timedelta(days=31), {"labels": {}, "merge": {}}, bills).cost, 200)
     os.unlink(path)
     os.unlink(bills)
+
+
+def test_app_kinds_and_bills_file():
+    print("\n== app kinds and the bills file ==")
+    check("exact name", nd.app_kind("firefox"), "Browser")
+    check("prefix pattern", nd.app_kind("gradle-daemon"), "Packages and builds")
+    check("first match wins", nd.app_kind("python3"), "Dev servers and tests")
+    check("unknown is Other", nd.app_kind("some-app"), nd.OTHER_KIND)
+    check("a pattern does not match a longer exact name", nd.app_kind("gitk"), nd.OTHER_KIND)
+    missing = tempfile.mktemp(suffix=".json")
+    check("a missing file reads as empty", nd.read_bills(missing), {"base": [], "cycles": {}})
+    bad = tempfile.mktemp(suffix=".json")
+    with open(bad, "w") as f:
+        f.write("{not json")
+    check("a corrupt file reads as empty", nd.read_bills(bad), {"base": [], "cycles": {}})
+    os.unlink(bad)
 
 
 def _empty_db():
@@ -347,6 +369,7 @@ if __name__ == "__main__":
     test_networks()
     test_household()
     test_bill()
+    test_app_kinds_and_bills_file()
     print("\n" + ("ALL TESTS PASSED" if not FAILS
                   else f"{len(FAILS)} FAILURE(S): {FAILS}"))
     sys.exit(1 if FAILS else 0)

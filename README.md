@@ -209,6 +209,14 @@ warning only; nothing is throttled or blocked.
 
 ## Phone app
 
+| Overview | Billing cycle | Networks | Apps | History | Data plan and limit |
+|---|---|---|---|---|---|
+| <img src="docs/screenshots/android-01-overview.png" width="150" alt="Overview"> | <img src="docs/screenshots/android-02-overview-chart.png" width="150" alt="Billing cycle"> | <img src="docs/screenshots/android-03-networks.png" width="150" alt="Networks"> | <img src="docs/screenshots/android-04-apps.png" width="150" alt="Apps"> | <img src="docs/screenshots/android-05-history.png" width="150" alt="History"> | <img src="docs/screenshots/android-07-data-plan.png" width="150" alt="Data plan and limit"> |
+
+<sub>Android emulator: its own traffic, router and SIM, no real data.</sub>
+
+**Download:** [`netusage-android.apk`](https://github.com/AbdelRahman-Madboly/netusage/releases/latest/download/netusage-android.apk) (Android 9 or newer, signed with a debug key).
+
 [`android/`](android) is the same tool for an Android phone (Kotlin, Jetpack Compose), with the
 same icon and pages: Overview, Networks, Apps, History, Settings.
 

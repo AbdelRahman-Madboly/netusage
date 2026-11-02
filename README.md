@@ -1,5 +1,7 @@
 # Internet Usage (netusage)
 
+<img src="docs/readme-icon.png" width="96" align="right" alt="Internet Usage (netusage) icon">
+
 Tracks how much internet a Linux laptop consumes over a monthly billing cycle
 (the start day is configurable), broken down by application and by network.
 An optional Android app adds the phone's usage.
@@ -371,3 +373,7 @@ MIT, see [LICENSE](LICENSE).
   window is recorded under its kernel `comm` name rather than a full one.
 - The collector claims no traffic for an interface the first time it sees it,
   since the counter already holds history it cannot attribute to this cycle.
+
+## Author
+
+Designed and built by Abdel Rahman Mohamad EL-Sayed ([AbdelRahman-Madboly](https://github.com/AbdelRahman-Madboly) on GitHub).

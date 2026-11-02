@@ -18,6 +18,8 @@
 
 [How it works](#how-it-works) · [Install](#install) · [Usage](#usage) · [Dashboard](#dashboard) · [Phone app](#phone-app) · [What it does not do](#what-it-does-not-do)
 
+<img src="docs/screenshots/01-overview.png" width="760" alt="netusage: Current billing cycle">
+
 </div>
 
 ## Why netusage
@@ -74,6 +76,22 @@ flowchart LR
 The interface total and the per-app split are collected independently and are not reconciled,
 so the total still works if eBPF fails. The phone app can also read the laptop's usage from the
 collector over the home network; each request is signed with a shared token that is never sent.
+
+## Screenshots
+
+| Daily usage and top apps | Per-app usage |
+|---|---|
+| ![Daily usage and top apps](docs/screenshots/02-daily-chart-top-apps.png) | ![Per-app usage](docs/screenshots/03-apps.png) |
+
+| Per-network usage | Past billing cycles |
+|---|---|
+| ![Per-network usage](docs/screenshots/04-networks.png) | ![Past billing cycles](docs/screenshots/05-history-cycles.png) |
+
+| Year calendar | Limits and alerts |
+|---|---|
+| ![Year calendar](docs/screenshots/06-history-calendar.png) | ![Limits and alerts](docs/screenshots/07-preferences-limits.png) |
+
+<sub>Screenshots use a made-up demo database, not real usage.</sub>
 
 ## Install
 

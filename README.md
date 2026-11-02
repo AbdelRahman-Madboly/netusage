@@ -49,6 +49,10 @@ dies. Design decisions, the bug log and open items are in [`NOTES.md`](NOTES.md)
 - **Desktop dashboard and phone app.** A GTK 4 / libadwaita dashboard that reads the database
   read-only, and a Kotlin app that adds the phone with the same pages.
 
+<img src="docs/concept-desk.jpg" width="640" alt="netusage on a laptop">
+
+<sub>Concept image of the app on a laptop. The screen shows the real screenshot above.</sub>
+
 ## How it works
 
 ```mermaid
